@@ -1,0 +1,102 @@
+version: "2"
+run:
+  concurrency: 4
+  issues-exit-code: 1
+output:
+  formats:
+    tab:
+      path: stdout
+      print-linter-name: true
+      colors: false
+linters:
+  default: all
+  disable:
+    - depguard
+    - err113
+    - exhaustruct
+    - nonamedreturns
+    - noinlineerr
+    - gochecknoglobals
+    - gochecknoinits
+    - mnd
+  settings:
+    cyclop:
+      max-complexity: 15
+    funlen:
+      lines: 120
+      statements: 60
+    gosec:
+      excludes:
+        - G112
+        - G117
+        - G304
+        - G404
+        - G704
+    lll:
+      line-length: 140
+    perfsprint:
+      strconcat: false
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+        - -ST1021
+        - -SA1029
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          yaml: snake
+        use-field-name: false
+    varnamelen:
+      ignore-names:
+        - err
+        - rv
+        - ch
+        - cb
+        - db
+        - id
+  exclusions:
+    generated: lax
+    paths:
+      - .+_test.go
+      - .local/*
+      - mocks/
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+issues:
+  max-issues-per-linter: 100
+  max-same-issues: 4
+  new: false
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/rishenco/reddit-mcp)
+      custom-order: true
+    goimports:
+      local-prefixes:
+        - github.com/rishenco/reddit-mcp
+  exclusions:
+    generated: lax
+    paths:
+      - .+_test.go
+      - .local/*
+      - mocks/
+      - third_party$
+      - builtin$
+      - examples$

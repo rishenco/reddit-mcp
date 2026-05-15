@@ -1,0 +1,12 @@
+services:
+  reddit-mcp:
+    build: .
+    image: reddit-mcp:local
+    container_name: reddit-mcp
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-7137}:8080"
+    env_file:
+      - .env
+    environment:
+      HTTP_ADDR: 0.0.0.0:8080
