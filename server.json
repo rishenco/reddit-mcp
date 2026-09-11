@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.rishenco/reddit-mcp",
+  "title": "Reddit",
+  "description": "Browse subreddits, search, read threads with their comment trees, and look up users over Reddit's Data API.",
+  "repository": {
+    "url": "https://github.com/rishenco/reddit-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/rishenco/reddit-mcp:0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "REDDIT_CLIENT_ID",
+          "description": "Reddit app-only OAuth client id. Without credentials the server falls back to the reduced public RSS feeds.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "REDDIT_CLIENT_SECRET",
+          "description": "Reddit app-only OAuth client secret. Must be set together with REDDIT_CLIENT_ID.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "REDDIT_USER_AGENT",
+          "description": "User-Agent sent to Reddit, e.g. 'go:reddit-mcp:v0.1.0 (by /u/yourname)'.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

@@ -12,12 +12,14 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     name: Build and publish binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       VERSION: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -33,6 +35,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Test
+        run: go test -count=1 ./...
+
       - name: Build release archives
         run: make dist VERSION="$VERSION"
 
@@ -45,3 +50,83 @@ jobs:
             --generate-notes \
             --verify-tag \
             dist/checksums.txt dist/reddit-mcp_*
+
+  image:
+    name: Build and push the container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Image tags drop the leading v, so they match the version server.json
+      # publishes to the MCP Registry.
+      - name: Compute tags
+        run: echo "IMAGE_VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ env.VERSION }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.IMAGE_VERSION }}
+            ghcr.io/${{ github.repository }}:latest
+
+  registry:
+    name: Publish to the MCP Registry
+    runs-on: ubuntu-latest
+    # The registry verifies the image annotation, so the image has to exist first.
+    needs: image
+    permissions:
+      contents: read
+      id-token: write # OIDC, so no long-lived token has to be stored
+    env:
+      VERSION: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Stamp the released version into server.json
+        run: |
+          version="${VERSION#v}"
+          jq --arg v "$version" \
+            '.version = $v
+             | .packages[0].identifier = "ghcr.io/${{ github.repository }}:" + $v' \
+            server.json > server.tmp
+          mv server.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Authenticate to the MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

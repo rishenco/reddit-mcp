@@ -7,7 +7,7 @@
       "env": {
         "REDDIT_CLIENT_ID": "${REDDIT_CLIENT_ID:-}",
         "REDDIT_CLIENT_SECRET": "${REDDIT_CLIENT_SECRET:-}",
-        "REDDIT_USER_AGENT": "${REDDIT_USER_AGENT:-reddit-mcp/0.1 (by /u/anonymous)}"
+        "REDDIT_USER_AGENT": "${REDDIT_USER_AGENT:-}"
       }
     }
   }

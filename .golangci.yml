@@ -62,6 +62,11 @@ linters:
         - cb
         - db
         - id
+        - b
+        - w
+        - r
+        - in
+        - s
   exclusions:
     generated: lax
     paths:

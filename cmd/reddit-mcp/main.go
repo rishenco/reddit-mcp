@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +28,9 @@ import (
 const (
 	serverName      = "reddit-mcp"
 	shutdownTimeout = 10 * time.Second
+	// keepAliveInterval pings the peer so a session whose client vanished without
+	// closing the transport is reaped instead of lingering.
+	keepAliveInterval = 30 * time.Second
 
 	// jsonrpcCodeServerClosing is jsonrpc2's non-standard "server is closing"
 	// code, reported when a request arrives while the connection is shutting down.
@@ -80,28 +84,48 @@ func run(transportFlag string) error {
 		logger.Info("starting reddit-mcp",
 			"transport", cfg.Transport, "auth", "app-only", "client_id", maskedID(cfg.ClientID))
 	} else {
+		logger.Warn("starting reddit-mcp without credentials: Reddit blocks logged-out Data API access " +
+			"from most networks, so results fall back to the reduced public RSS feeds " +
+			"(no scores, comment counts or NSFW flags). Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET for full data.")
 		logger.Info("starting reddit-mcp", "transport", cfg.Transport, "auth", "anonymous")
 	}
 
-	redditClient := reddit.New(
-		cfg.ClientID,
-		cfg.ClientSecret,
-		cfg.UserAgent,
-		cfg.RateLimitRPM,
-		logger,
-	)
+	userAgent := cfg.UserAgentOrDefault(serverVersion())
+	if !strings.Contains(userAgent, "/u/") {
+		logger.Warn("REDDIT_USER_AGENT names no Reddit account; " +
+			"Reddit asks for '<platform>:<app id>:<version> (by /u/<username>)' and blocks generic agents sooner")
+	}
+
+	redditClient := reddit.New(reddit.Options{
+		ClientID:         cfg.ClientID,
+		ClientSecret:     cfg.ClientSecret,
+		UserAgent:        userAgent,
+		RateLimitRPM:     cfg.RateLimitRPM,
+		CacheTTL:         cfg.CacheTTL,
+		CacheMaxBytes:    cfg.CacheMaxBytes(),
+		ListingTextChars: cfg.ListingTextChars,
+		Logger:           logger,
+	})
+
+	serverOpts := &mcp.ServerOptions{Instructions: tools.Instructions}
+
+	// Keepalive pings only earn their keep over HTTP, where a client can vanish
+	// without the server noticing. On stdio, a closed stdin already says so.
+	if cfg.Transport == config.TransportHTTP {
+		serverOpts.KeepAlive = keepAliveInterval
+	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
 		Version: serverVersion(),
-	}, nil)
+	}, serverOpts)
 	tools.Register(mcpServer, redditClient)
 
 	if cfg.Transport == config.TransportStdio {
 		return runStdio(ctx, mcpServer, logger)
 	}
 
-	return runHTTP(ctx, mcpServer, cfg.HTTPAddr, logger)
+	return runHTTP(ctx, mcpServer, cfg, logger)
 }
 
 // serverVersion reports the build's version: the stamped one for release
@@ -146,12 +170,22 @@ func isClientDisconnect(err error) bool {
 	return errors.As(err, &wireErr) && wireErr.Code == jsonrpcCodeServerClosing
 }
 
-func runHTTP(ctx context.Context, mcpServer *mcp.Server, addr string, logger *slog.Logger) error {
-	httpServer := transporthttp.NewMCPServer(mcpServer, addr, logger)
+func runHTTP(ctx context.Context, mcpServer *mcp.Server, cfg config.Config, logger *slog.Logger) error {
+	httpServer := transporthttp.NewMCPServer(mcpServer, transporthttp.Options{
+		Addr:      cfg.HTTPAddr,
+		AuthToken: cfg.HTTPAuthToken,
+		Logger:    logger,
+	})
 
 	go shutdownOnSignal(ctx, httpServer, logger)
 
-	logger.Info("listening", "addr", addr, "endpoint", "/mcp")
+	if cfg.HTTPAuthToken == "" && !strings.HasPrefix(cfg.HTTPAddr, "127.0.0.1") &&
+		!strings.HasPrefix(cfg.HTTPAddr, "localhost") {
+		logger.Warn("http transport is listening beyond loopback with no MCP_AUTH_TOKEN set; "+
+			"anyone who can reach this port can spend the Reddit rate limit", "addr", cfg.HTTPAddr)
+	}
+
+	logger.Info("listening", "addr", cfg.HTTPAddr, "endpoint", "/mcp", "auth", cfg.HTTPAuthToken != "")
 
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("http server: %w", err)

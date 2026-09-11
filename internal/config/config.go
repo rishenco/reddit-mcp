@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 )
@@ -14,16 +15,32 @@ const (
 	TransportStdio = "stdio"
 	// TransportHTTP serves MCP over streamable HTTP on HTTPAddr.
 	TransportHTTP = "http"
+
+	bytesPerMB = 1024 * 1024
 )
 
 type Config struct {
 	ClientID     string `envconfig:"REDDIT_CLIENT_ID"`
 	ClientSecret string `envconfig:"REDDIT_CLIENT_SECRET"`
-	UserAgent    string `default:"reddit-mcp/0.1 (by /u/anonymous)" envconfig:"REDDIT_USER_AGENT"`
-	Transport    string `default:"stdio"                            envconfig:"MCP_TRANSPORT"`
-	HTTPAddr     string `default:"0.0.0.0:8080"                     envconfig:"HTTP_ADDR"`
-	VerboseLog   bool   `default:"false"                            envconfig:"VERBOSE_LOG"`
-	RateLimitRPM int    `default:"0"                                envconfig:"RATE_LIMIT_RPM"`
+	UserAgent    string `envconfig:"REDDIT_USER_AGENT"`
+	Transport    string `default:"stdio"                  envconfig:"MCP_TRANSPORT"`
+	HTTPAddr     string `default:"127.0.0.1:8080"         envconfig:"HTTP_ADDR"`
+	VerboseLog   bool   `default:"false"                  envconfig:"VERBOSE_LOG"`
+	RateLimitRPM int    `default:"0"                      envconfig:"RATE_LIMIT_RPM"`
+
+	// HTTPAuthToken, when set, is required as a bearer token on the http
+	// transport. Without it the endpoint is open to whoever can reach the port.
+	HTTPAuthToken string `envconfig:"MCP_AUTH_TOKEN"`
+
+	// CacheTTL is the base freshness window for cached Reddit responses.
+	// Listings use it directly; threads and profiles keep results longer.
+	// Zero disables caching.
+	CacheTTL time.Duration `default:"5m" envconfig:"CACHE_TTL"`
+	// CacheMaxMB bounds the response cache. Zero disables caching.
+	CacheMaxMB int `default:"50" envconfig:"CACHE_MAX_MB"`
+	// ListingTextChars caps self-text and comment bodies inside listings, where
+	// full bodies are wasted context. Zero disables the cap.
+	ListingTextChars int `default:"500" envconfig:"LISTING_TEXT_CHARS"`
 }
 
 func Load() (Config, error) {
@@ -63,4 +80,29 @@ func NormalizeTransport(transport string) (string, error) {
 
 func (cfg Config) Authenticated() bool {
 	return cfg.ClientID != "" && cfg.ClientSecret != ""
+}
+
+// CacheMaxBytes converts the configured cache budget into bytes.
+func (cfg Config) CacheMaxBytes() int64 {
+	if cfg.CacheMaxMB <= 0 {
+		return 0
+	}
+
+	return int64(cfg.CacheMaxMB) * bytesPerMB
+}
+
+// DefaultUserAgent follows the format Reddit asks for,
+// <platform>:<app id>:<version>, stamped with the running build.
+func DefaultUserAgent(version string) string {
+	return "go:github.com/rishenco/reddit-mcp:" + version
+}
+
+// UserAgentOrDefault returns the configured User-Agent, falling back to a
+// version-stamped default rather than a hardcoded one that drifts from the build.
+func (cfg Config) UserAgentOrDefault(version string) string {
+	if strings.TrimSpace(cfg.UserAgent) != "" {
+		return cfg.UserAgent
+	}
+
+	return DefaultUserAgent(version)
 }

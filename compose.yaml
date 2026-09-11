@@ -5,7 +5,8 @@ services:
     container_name: reddit-mcp
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-7137}:8080"
+      # Loopback only: /mcp has no authentication unless MCP_AUTH_TOKEN is set.
+      - "127.0.0.1:${HTTP_PORT:-7137}:8080"
     env_file:
       - .env
     environment:

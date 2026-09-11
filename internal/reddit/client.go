@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,16 +24,45 @@ const (
 	oauthEndpoint = "https://www.reddit.com/api/v1/access_token"
 	maxRetries    = 3
 
-	httpTimeout      = 30 * time.Second
-	tokenLeeway      = 10 * time.Second
-	backoffBaseMS    = 100
-	backoffCapMS     = 30000
-	defaultRPMAnon   = 10
-	defaultRPMAuthed = 60
-	errBodyLimit     = 1024
-	htmlBodyLimit    = 512
-	errMsgLimit      = 200
+	httpTimeout = 30 * time.Second
+	tokenLeeway = 10 * time.Second
+
+	backoffBaseMS = 100
+	backoffCapMS  = 30000
+
+	// defaultRPMAnon is deliberately low: without credentials the only thing
+	// that still answers is the public RSS feed, which Reddit throttles per IP
+	// far more aggressively than the Data API.
+	defaultRPMAnon = 10
+	// defaultRPMAuthed matches the 100 queries/minute per OAuth client id that
+	// Reddit documents for free Data API access.
+	defaultRPMAuthed = 100
+
+	errBodyLimit = 2048
+	errMsgLimit  = 200
 )
+
+// Options configures a Client. The zero value is a usable anonymous client with
+// caching disabled.
+type Options struct {
+	ClientID      string
+	ClientSecret  string
+	UserAgent     string
+	RateLimitRPM  int
+	CacheTTL      time.Duration
+	CacheMaxBytes int64
+	// ListingTextChars caps post self-text and comment bodies inside listings,
+	// where the model is skimming rather than reading. Zero disables the cap.
+	ListingTextChars int
+
+	// BaseURL and RSSBaseURL override the Reddit endpoints. They default to
+	// Reddit's own hosts and exist so the client can be pointed at a stub or a
+	// compatible mirror.
+	BaseURL    string
+	RSSBaseURL string
+
+	Logger *slog.Logger
+}
 
 type Client struct {
 	httpClient   *http.Client
@@ -41,19 +71,28 @@ type Client struct {
 	clientID     string
 	clientSecret string
 	baseURL      string
+	rssBaseURL   string
 	authed       bool
 
-	limiter *limiter
+	limiter     *limiter
+	cache       *cache
+	cacheTTL    time.Duration
+	listingText int
+
+	// jsonBlocked latches once Reddit has refused logged-out Data API access.
+	// Without it every anonymous call would spend a request discovering the
+	// same 403 before falling back to RSS.
+	jsonBlocked atomic.Bool
 
 	tokenMu     sync.Mutex
 	accessToken string
 	tokenExpiry time.Time
 }
 
-func New(clientID, clientSecret, userAgent string, rateLimitRPM int, logger *slog.Logger) *Client {
-	authed := clientID != "" && clientSecret != ""
+func New(opts Options) *Client {
+	authed := opts.ClientID != "" && opts.ClientSecret != ""
 
-	rpm := rateLimitRPM
+	rpm := opts.RateLimitRPM
 	if rpm <= 0 {
 		rpm = defaultRPMAnon
 		if authed {
@@ -66,32 +105,100 @@ func New(clientID, clientSecret, userAgent string, rateLimitRPM int, logger *slo
 		baseURL = authHost
 	}
 
+	if opts.BaseURL != "" {
+		baseURL = opts.BaseURL
+	}
+
+	rssBaseURL := anonHost
+	if opts.RSSBaseURL != "" {
+		rssBaseURL = opts.RSSBaseURL
+	}
+
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+
 	return &Client{
 		httpClient:   &http.Client{Timeout: httpTimeout},
 		logger:       logger,
-		userAgent:    userAgent,
-		clientID:     clientID,
-		clientSecret: clientSecret,
+		userAgent:    opts.UserAgent,
+		clientID:     opts.ClientID,
+		clientSecret: opts.ClientSecret,
 		baseURL:      baseURL,
+		rssBaseURL:   rssBaseURL,
 		authed:       authed,
 		limiter:      newLimiter(rpm, logger),
+		cache:        newCache(opts.CacheMaxBytes),
+		cacheTTL:     opts.CacheTTL,
+		listingText:  opts.ListingTextChars,
 	}
 }
 
 func (c *Client) Authenticated() bool { return c.authed }
 
+// JSONBlocked reports whether Reddit has refused logged-out Data API access in
+// this process, meaning results are coming from the reduced RSS feeds.
+func (c *Client) JSONBlocked() bool { return c.jsonBlocked.Load() }
+
+// CacheStats exposes counters for the "cache" log line on shutdown and for tests.
+func (c *Client) CacheStats() (hits, misses int64, entries int) { return c.cache.stats() }
+
+// get calls the Reddit Data API. When the API is unreachable anonymously it
+// returns an error for which IsBlocked reports true, which is the caller's cue
+// to try the RSS equivalent.
 func (c *Client) get(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
+	if !c.authed && c.jsonBlocked.Load() {
+		return nil, &APIError{
+			Status: http.StatusForbidden,
+			Kind:   KindBlocked,
+			Detail: "logged-out Data API access is blocked",
+			Hint:   blockedHintAnon,
+		}
+	}
+
 	if params == nil {
 		params = url.Values{}
 	}
 
 	params.Set("raw_json", "1")
 
-	if !c.authed && !strings.HasSuffix(path, ".json") {
-		path += ".json"
+	apiPath := path
+	if !c.authed && !strings.HasSuffix(apiPath, ".json") {
+		apiPath += ".json"
 	}
 
-	fullURL := c.baseURL + path + "?" + params.Encode()
+	body, err := c.fetch(ctx, c.baseURL+apiPath+"?"+params.Encode(), path, "json")
+	if err != nil {
+		if !c.authed && IsBlocked(err) && c.jsonBlocked.CompareAndSwap(false, true) {
+			c.logger.Warn("reddit blocks logged-out Data API access; falling back to public RSS feeds " +
+				"(set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET for full data)")
+		}
+
+		return nil, err
+	}
+
+	return body, nil
+}
+
+// getRSS calls a public Atom feed on www.reddit.com. These feeds answer without
+// credentials, but carry no scores, comment counts or ratios.
+func (c *Client) getRSS(ctx context.Context, path string, params url.Values) ([]byte, error) {
+	if params == nil {
+		params = url.Values{}
+	}
+
+	return c.fetch(ctx, c.rssBaseURL+path+"?"+params.Encode(), path, "xml")
+}
+
+// fetch runs one request through the limiter with retries. expect is the
+// substring the response Content-Type must contain.
+func (c *Client) fetch(ctx context.Context, fullURL, cachePath, expect string) ([]byte, error) {
+	if body, _, ok := c.cache.get(fullURL); ok {
+		c.logger.Debug("reddit cache hit", "url", fullURL)
+
+		return body, nil
+	}
 
 	c.logger.Debug("reddit GET", "url", fullURL)
 
@@ -102,49 +209,59 @@ func (c *Client) get(ctx context.Context, path string, params url.Values) (json.
 			return nil, fmt.Errorf("rate-limit wait: %w", err)
 		}
 
-		req, err := c.buildRequest(ctx, fullURL)
-		if err != nil {
-			return nil, err
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("http do: %w", err)
-			c.logger.Debug("reddit transport error", "attempt", attempt, "err", err)
-
-			if berr := c.sleepBackoff(ctx, attempt); berr != nil {
-				return nil, fmt.Errorf("backoff: %w", berr)
-			}
-
-			continue
-		}
-
-		c.limiter.observe(resp.Header, parseRetryAfter(resp.Header.Get("Retry-After")))
-
-		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-			body, readErr := readJSONBody(resp)
-			if readErr != nil {
-				return nil, fmt.Errorf("read body: %w", readErr)
-			}
+		body, retry, err := c.attempt(ctx, fullURL, expect, attempt)
+		if err == nil {
+			c.cache.put(fullURL, body, expect, ttlFor(cachePath, c.cacheTTL))
 
 			return body, nil
 		}
 
-		retry, statusErr := c.handleNonSuccess(ctx, resp, attempt)
-		lastErr = statusErr
+		lastErr = err
 
 		if !retry {
 			return nil, lastErr
 		}
 
-		if resp.StatusCode >= http.StatusInternalServerError {
-			if berr := c.sleepBackoff(ctx, attempt); berr != nil {
-				return nil, fmt.Errorf("backoff: %w", berr)
-			}
+		if attempt == maxRetries {
+			break // no point sleeping before giving up
+		}
+
+		if berr := c.sleepBackoff(ctx, attempt); berr != nil {
+			return nil, fmt.Errorf("backoff: %w", berr)
 		}
 	}
 
-	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+	return nil, fmt.Errorf("gave up after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+// attempt performs a single request, reporting whether a retry is worthwhile.
+func (c *Client) attempt(ctx context.Context, fullURL, expect string, attempt int) ([]byte, bool, error) {
+	req, err := c.buildRequest(ctx, fullURL)
+	if err != nil {
+		return nil, false, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.logger.Debug("reddit transport error", "attempt", attempt, "err", err)
+
+		return nil, true, fmt.Errorf("http do: %w", err)
+	}
+
+	c.limiter.observe(resp.Header, parseRetryAfter(resp.Header.Get("Retry-After")))
+
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		body, readErr := readBody(resp, expect)
+		if readErr != nil {
+			return nil, false, readErr
+		}
+
+		return body, false, nil
+	}
+
+	retry, statusErr := c.handleNonSuccess(ctx, resp, attempt)
+
+	return nil, retry, statusErr
 }
 
 func (c *Client) buildRequest(ctx context.Context, fullURL string) (*http.Request, error) {
@@ -154,7 +271,7 @@ func (c *Client) buildRequest(ctx context.Context, fullURL string) (*http.Reques
 	}
 
 	req.Header.Set("User-Agent", c.userAgent)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, application/atom+xml;q=0.9")
 
 	if c.authed {
 		tok, tokErr := c.token(ctx, false)
@@ -172,9 +289,9 @@ func (c *Client) handleNonSuccess(ctx context.Context, resp *http.Response, atte
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 	_ = resp.Body.Close()
 
-	apiErr := &APIError{Status: resp.StatusCode, Body: string(body)}
+	apiErr := classify(resp.StatusCode, resp.Header.Get("Content-Type"), body, c.authed)
 
-	if resp.StatusCode == http.StatusUnauthorized && c.authed && attempt == 0 {
+	if apiErr.Kind == KindUnauthorized && c.authed && attempt == 0 {
 		c.logger.Debug("reddit 401, refreshing token")
 
 		if _, err := c.token(ctx, true); err != nil {
@@ -184,30 +301,28 @@ func (c *Client) handleNonSuccess(ctx context.Context, resp *http.Response, atte
 		return true, apiErr
 	}
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		c.logger.Debug("reddit 429, deferring to limiter barrier", "attempt", attempt)
+	c.logger.Debug("reddit request failed",
+		"status", apiErr.Status, "kind", apiErr.Kind, "attempt", attempt)
 
-		return true, apiErr
-	}
-
-	if resp.StatusCode >= http.StatusInternalServerError {
-		c.logger.Debug("reddit 5xx", "status", resp.StatusCode, "attempt", attempt)
-
-		return true, apiErr
-	}
-
-	return false, apiErr
+	return apiErr.Retryable(), apiErr
 }
 
-func readJSONBody(resp *http.Response) (json.RawMessage, error) {
+// readBody reads a successful response, rejecting payloads whose Content-Type
+// does not match what the caller asked for — Reddit answers some blocks with a
+// 200 HTML page.
+func readBody(resp *http.Response, expect string) ([]byte, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-	if !strings.Contains(contentType, "json") {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, htmlBodyLimit))
+	if !strings.Contains(contentType, expect) {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errBodyLimit))
 
-		return nil, fmt.Errorf("unexpected content-type %q (got HTML or similar instead of JSON): %s",
-			contentType, truncate(string(body), htmlBodyLimit/2))
+		return nil, &APIError{
+			Status: resp.StatusCode,
+			Kind:   KindBlocked,
+			Detail: fmt.Sprintf("expected %s but got %s", expect, summarizeContentType(contentType)),
+			Hint:   blockedHintAnon,
+		}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -268,15 +383,6 @@ func parseRetryAfter(header string) time.Duration {
 	return 0
 }
 
-type APIError struct {
-	Status int
-	Body   string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("reddit api: status %d: %s", e.Status, truncate(e.Body, errMsgLimit))
-}
-
 func truncate(s string, limit int) string {
 	if len(s) > limit {
 		return s[:limit] + "..."
@@ -312,14 +418,13 @@ func (c *Client) token(ctx context.Context, force bool) (string, error) {
 
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 	if err != nil {
 		return "", fmt.Errorf("read token body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token endpoint status %d: %s",
-			resp.StatusCode, truncate(string(body), errMsgLimit))
+		return "", classify(resp.StatusCode, resp.Header.Get("Content-Type"), body, true)
 	}
 
 	var tok struct {
