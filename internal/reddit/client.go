@@ -54,6 +54,9 @@ type Options struct {
 	// ListingTextChars caps post self-text and comment bodies inside listings,
 	// where the model is skimming rather than reading. Zero disables the cap.
 	ListingTextChars int
+	// CommentTextChars caps comment bodies inside a thread, which are read
+	// rather than skimmed. Zero, the default, keeps them whole.
+	CommentTextChars int
 
 	// BaseURL and RSSBaseURL override the Reddit endpoints. They default to
 	// Reddit's own hosts and exist so the client can be pointed at a stub or a
@@ -78,6 +81,7 @@ type Client struct {
 	cache       *cache
 	cacheTTL    time.Duration
 	listingText int
+	commentText int
 
 	// jsonBlocked latches once Reddit has refused logged-out Data API access.
 	// Without it every anonymous call would spend a request discovering the
@@ -132,6 +136,7 @@ func New(opts Options) *Client {
 		cache:        newCache(opts.CacheMaxBytes),
 		cacheTTL:     opts.CacheTTL,
 		listingText:  opts.ListingTextChars,
+		commentText:  opts.CommentTextChars,
 	}
 }
 

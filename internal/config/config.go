@@ -41,6 +41,9 @@ type Config struct {
 	// ListingTextChars caps self-text and comment bodies inside listings, where
 	// full bodies are wasted context. Zero disables the cap.
 	ListingTextChars int `default:"500" envconfig:"LISTING_TEXT_CHARS"`
+	// CommentTextChars caps comment bodies inside a thread, which are read
+	// rather than skimmed. Zero, the default, keeps them whole.
+	CommentTextChars int `default:"0" envconfig:"COMMENT_TEXT_CHARS"`
 }
 
 func Load() (Config, error) {

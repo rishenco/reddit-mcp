@@ -46,6 +46,8 @@ var (
 	// for link posts and at the permalink for self posts.
 	linkHrefRE = regexp.MustCompile(`<a href="([^"]+)"[^>]*>\s*\[link\]`)
 	tagRE      = regexp.MustCompile(`<[^>]*>`)
+	imgRE      = regexp.MustCompile(`<img[^>]*>`)
+	anchorRE   = regexp.MustCompile(`(?s)<a\b[^>]*>.*?</a>`)
 	spaceRE    = regexp.MustCompile(`[ \t]+`)
 	// permalinkSubRE pulls the subreddit out of a permalink, the only place a
 	// comment feed records it.
@@ -67,7 +69,7 @@ func parseRSSPosts(body []byte, maxText int) (*PostList, error) {
 		return nil, err
 	}
 
-	out := &PostList{DataSource: SourceRSS, Note: rssNote, Posts: []Post{}}
+	out := &PostList{source: rssSource()}
 
 	for _, entry := range feed.Entries {
 		id, ok := strings.CutPrefix(entry.ID, "t3_")
@@ -75,7 +77,7 @@ func parseRSSPosts(body []byte, maxText int) (*PostList, error) {
 			continue
 		}
 
-		selftext, truncated := truncateText(entryBody(entry.Content), maxText)
+		selftext, truncated := truncateText(postBody(entry.Content), maxText)
 		permalink := entry.Link.Href
 
 		target := permalink
@@ -106,7 +108,7 @@ func parseRSSComments(body []byte, maxText int) (*CommentList, error) {
 		return nil, err
 	}
 
-	out := &CommentList{DataSource: SourceRSS, Note: rssNote, Comments: []Comment{}}
+	out := &CommentList{source: rssSource()}
 
 	for _, entry := range feed.Entries {
 		id, ok := strings.CutPrefix(entry.ID, "t1_")
@@ -114,7 +116,7 @@ func parseRSSComments(body []byte, maxText int) (*CommentList, error) {
 			continue
 		}
 
-		text, truncated := truncateText(entryBody(entry.Content), maxText)
+		text, truncated := truncateText(postBody(entry.Content), maxText)
 
 		out.Comments = append(out.Comments, Comment{
 			ID:            id,
@@ -123,6 +125,7 @@ func parseRSSComments(body []byte, maxText int) (*CommentList, error) {
 			BodyTruncated: truncated,
 			CreatedUTC:    parseAtomTime(entry.Updated),
 			Permalink:     entry.Link.Href,
+			Subreddit:     subredditFrom(entry, entry.Link.Href),
 		})
 	}
 
@@ -135,7 +138,7 @@ func parseRSSSubreddits(body []byte) (*SubredditList, error) {
 		return nil, err
 	}
 
-	out := &SubredditList{DataSource: SourceRSS, Note: rssNote, Subreddits: []Subreddit{}}
+	out := &SubredditList{source: rssSource()}
 
 	for _, entry := range feed.Entries {
 		if !strings.HasPrefix(entry.ID, "t5_") {
@@ -147,7 +150,7 @@ func parseRSSSubreddits(body []byte) (*SubredditList, error) {
 			// so the addressable name has to come out of the link.
 			Name:        subredditFromPermalink(entry.Link.Href),
 			Title:       cleanText(entry.Title),
-			Description: entryBody(entry.Content),
+			Description: subredditDescription(entry.Content),
 			CreatedUTC:  parseAtomTime(entry.Updated),
 			URL:         entry.Link.Href,
 		})
@@ -156,21 +159,27 @@ func parseRSSSubreddits(body []byte) (*SubredditList, error) {
 	return out, nil
 }
 
-// entryBody renders the post or comment text out of an Atom entry's HTML
-// content, dropping Reddit's trailing "submitted by … [link] [comments]" chrome.
-func entryBody(content string) string {
-	if m := selfTextRE.FindStringSubmatch(content); m != nil {
-		return cleanText(m[1])
+// postBody is the text of a post or comment. Reddit wraps the real body in
+// SC_OFF/SC_ON markers and surrounds it with chrome — a thumbnail, "submitted
+// by /u/x to r/y", and [link]/[comments] anchors. Anything outside the markers
+// is that chrome, so a link post, which has no body at all, gets an empty one
+// rather than a sentence about who submitted it.
+func postBody(content string) string {
+	m := selfTextRE.FindStringSubmatch(content)
+	if m == nil {
+		return ""
 	}
 
-	// Subreddit feeds have no SC_OFF marker; their description is a bare div
-	// next to the [link] anchor.
-	stripped := linkHrefRE.ReplaceAllString(content, "")
-	text := cleanText(stripped)
+	return cleanText(m[1])
+}
 
-	text = strings.TrimSuffix(text, "[link]")
+// subredditDescription pulls the blurb out of a t5 feed entry, which has no
+// SC_OFF markers: a thumbnail, the description text, and a [link] anchor.
+func subredditDescription(content string) string {
+	stripped := imgRE.ReplaceAllString(content, "")
+	stripped = anchorRE.ReplaceAllString(stripped, "")
 
-	return strings.TrimSpace(text)
+	return cleanText(stripped)
 }
 
 func cleanText(s string) string {

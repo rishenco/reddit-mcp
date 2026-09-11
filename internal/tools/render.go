@@ -9,10 +9,10 @@ import (
 	"github.com/rishenco/reddit-mcp/internal/reddit"
 )
 
-// The MCP SDK, left to itself, puts the tool's JSON result in structuredContent
-// and then repeats it verbatim as a text block, so every response crosses the
-// wire twice. Filling Content with a compact rendering keeps the machine-readable
-// half intact while giving the model something a good deal cheaper to read.
+// Tools return text, not JSON. Declaring structured output would make the SDK
+// publish an output schema per tool and repeat the whole payload alongside the
+// rendering — on this tool set that was 9.7 KB of schema in every tools/list
+// and roughly double the bytes in every result, for data nothing reads back.
 
 const (
 	indentWidth  = 2
@@ -65,7 +65,7 @@ func postStats(post reddit.Post) string {
 	}
 
 	if len(parts) == 0 {
-		return "no metrics (rss)"
+		return "metrics unknown"
 	}
 
 	return strings.Join(parts, " · ")
@@ -97,42 +97,38 @@ func postFlags(post reddit.Post) string {
 	return " [" + strings.Join(flags, " ") + "]"
 }
 
-func renderPost(post *reddit.Post) string {
-	var b strings.Builder
-
-	fmt.Fprintf(&b, "%s\n", oneLine(post.Title))
-	fmt.Fprintf(&b, "%s · u/%s · %s\n", postStats(*post), post.Author, formatTime(post.CreatedUTC))
-	fmt.Fprintf(&b, "id=%s r/%s%s\n", post.ID, post.Subreddit, postFlags(*post))
-	fmt.Fprintf(&b, "%s\n", post.Permalink)
+func writePost(b *strings.Builder, post *reddit.Post) {
+	fmt.Fprintf(b, "%s\n", oneLine(post.Title))
+	fmt.Fprintf(b, "%s · u/%s · %s\n", postStats(*post), post.Author, formatTime(post.CreatedUTC))
+	fmt.Fprintf(b, "id=%s r/%s%s\n", post.ID, post.Subreddit, postFlags(*post))
+	fmt.Fprintf(b, "%s\n", post.Permalink)
 
 	if post.URL != "" && post.URL != post.Permalink {
-		fmt.Fprintf(&b, "link: %s\n", post.URL)
+		fmt.Fprintf(b, "link: %s\n", post.URL)
 	}
 
 	if post.Selftext != "" {
-		fmt.Fprintf(&b, "\n%s\n", post.Selftext)
+		fmt.Fprintf(b, "\n%s\n", post.Selftext)
 
 		if post.SelftextTruncated {
 			b.WriteString("[self-text truncated]\n")
 		}
 	}
-
-	return b.String()
 }
 
 func renderPostWithComments(post *reddit.Post, list *reddit.CommentList) string {
 	var b strings.Builder
 
-	b.WriteString(renderPost(post))
+	writePost(&b, post)
 
 	if list.Note != "" {
 		fmt.Fprintf(&b, "\nnote: %s\n", list.Note)
 	}
 
-	fmt.Fprintf(&b, "\n--- %d comments (source: %s) ---\n", len(list.Comments), list.DataSource)
+	fmt.Fprintf(&b, "\n--- %d comments ---\n", len(list.Comments))
 
 	for _, comment := range list.Comments {
-		writeComment(&b, comment)
+		writeComment(&b, comment, false)
 	}
 
 	writeMore(&b, list)
@@ -146,7 +142,7 @@ func renderCommentList(header string, list *reddit.CommentList) string {
 	writeHeader(&b, header, len(list.Comments), "comment", list.DataSource, list.Note)
 
 	for _, comment := range list.Comments {
-		writeComment(&b, comment)
+		writeComment(&b, comment, true)
 	}
 
 	writeMore(&b, list)
@@ -155,10 +151,12 @@ func renderCommentList(header string, list *reddit.CommentList) string {
 	return b.String()
 }
 
-func writeComment(b *strings.Builder, comment reddit.Comment) {
+// writeComment indents by reply depth. withContext adds the subreddit and a
+// link, which a standalone comment stream needs and a thread does not.
+func writeComment(b *strings.Builder, comment reddit.Comment, withContext bool) {
 	indent := strings.Repeat(" ", min(comment.Depth, maxIndent)*indentWidth)
 
-	score := "no score (rss)"
+	score := "score unknown"
 	if comment.Score != nil {
 		score = strconv.Itoa(*comment.Score) + " pts"
 	}
@@ -170,6 +168,14 @@ func writeComment(b *strings.Builder, comment reddit.Comment) {
 
 	fmt.Fprintf(b, "\n%su/%s%s · %s · %s · id=%s\n",
 		indent, comment.Author, submitter, score, formatTime(comment.CreatedUTC), comment.ID)
+
+	if withContext {
+		if comment.Subreddit != "" {
+			fmt.Fprintf(b, "%sr/%s · %s\n", indent, comment.Subreddit, comment.Permalink)
+		} else {
+			fmt.Fprintf(b, "%s%s\n", indent, comment.Permalink)
+		}
+	}
 
 	for _, line := range strings.Split(comment.Body, "\n") {
 		fmt.Fprintf(b, "%s%s\n", indent, line)
@@ -204,13 +210,7 @@ func renderSubredditList(header string, list *reddit.SubredditList) string {
 		fmt.Fprintf(&b, "\n%d. r/%s — %s\n", i+1, sub.Name, oneLine(sub.Title))
 
 		if sub.Subscribers != nil {
-			fmt.Fprintf(&b, "   %d subscribers", *sub.Subscribers)
-
-			if sub.ActiveUsers != nil {
-				fmt.Fprintf(&b, " · %d online", *sub.ActiveUsers)
-			}
-
-			b.WriteString("\n")
+			fmt.Fprintf(&b, "   %s\n", subredditCounts(sub))
 		}
 
 		if desc := oneLine(sub.Description); desc != "" {
@@ -223,19 +223,22 @@ func renderSubredditList(header string, list *reddit.SubredditList) string {
 	return b.String()
 }
 
+func subredditCounts(sub reddit.Subreddit) string {
+	out := strconv.Itoa(*sub.Subscribers) + " subscribers"
+	if sub.ActiveUsers != nil {
+		out += " · " + strconv.Itoa(*sub.ActiveUsers) + " online"
+	}
+
+	return out
+}
+
 func renderSubreddit(sub *reddit.Subreddit) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "r/%s — %s\n", sub.Name, oneLine(sub.Title))
 
 	if sub.Subscribers != nil {
-		fmt.Fprintf(&b, "%d subscribers", *sub.Subscribers)
-
-		if sub.ActiveUsers != nil {
-			fmt.Fprintf(&b, " · %d online", *sub.ActiveUsers)
-		}
-
-		b.WriteString("\n")
+		fmt.Fprintf(&b, "%s\n", subredditCounts(*sub))
 	} else {
 		b.WriteString("subscriber and activity counts unavailable without credentials\n")
 	}
@@ -247,14 +250,64 @@ func renderSubreddit(sub *reddit.Subreddit) string {
 			fmt.Fprintf(&b, " · %s", sub.SubredditType)
 		}
 
+		if sub.Over18 != nil && *sub.Over18 {
+			b.WriteString(" · nsfw")
+		}
+
 		b.WriteString("\n")
 	}
+
+	fmt.Fprintf(&b, "%s\n", sub.URL)
 
 	if sub.Description != "" {
 		fmt.Fprintf(&b, "\n%s\n", sub.Description)
 	}
 
-	fmt.Fprintf(&b, "%s\n", sub.URL)
+	if len(sub.Rules) > 0 {
+		fmt.Fprintf(&b, "\n--- %d rules ---\n", len(sub.Rules))
+
+		for i, rule := range sub.Rules {
+			fmt.Fprintf(&b, "\n%d. %s", i+1, rule.Name)
+
+			if rule.Kind != "" {
+				fmt.Fprintf(&b, " (applies to: %s)", rule.Kind)
+			}
+
+			b.WriteString("\n")
+
+			if rule.Description != "" {
+				fmt.Fprintf(&b, "   %s\n", oneLine(rule.Description))
+			}
+		}
+	}
+
+	return b.String()
+}
+
+func renderWikiPage(page *reddit.WikiPage) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "r/%s wiki: %s\n", page.Subreddit, page.Page)
+
+	if page.RevisedUTC > 0 {
+		fmt.Fprintf(&b, "last revised %s", formatTime(page.RevisedUTC))
+
+		if page.RevisedBy != "" {
+			fmt.Fprintf(&b, " by u/%s", page.RevisedBy)
+		}
+
+		b.WriteString("\n")
+	}
+
+	fmt.Fprintf(&b, "%s\n", page.URL)
+
+	if page.Content == "" {
+		b.WriteString("\nThis wiki page is empty.\n")
+
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "\n%s\n", page.Content)
 
 	return b.String()
 }
@@ -266,7 +319,45 @@ func renderUser(user *reddit.User) string {
 	fmt.Fprintf(&b, "%d post karma · %d comment karma · joined %s\n",
 		user.LinkKarma, user.CommentKarma, formatTime(user.CreatedUTC))
 
+	if flags := userFlags(*user); flags != "" {
+		fmt.Fprintf(&b, "%s\n", flags)
+	}
+
+	fmt.Fprintf(&b, "https://www.reddit.com/user/%s/\n", user.Name)
+
+	if user.PublicDescription != "" {
+		fmt.Fprintf(&b, "\n%s\n", user.PublicDescription)
+	}
+
+	return b.String()
+}
+
+func renderUserList(header string, list *reddit.UserList) string {
+	var b strings.Builder
+
+	writeHeader(&b, header, len(list.Users), "user", list.DataSource, list.Note)
+
+	for i, user := range list.Users {
+		fmt.Fprintf(&b, "\n%d. u/%s — %d post karma · %d comment karma · joined %s\n",
+			i+1, user.Name, user.LinkKarma, user.CommentKarma, formatTime(user.CreatedUTC))
+
+		if flags := userFlags(user); flags != "" {
+			fmt.Fprintf(&b, "   %s\n", flags)
+		}
+
+		if desc := oneLine(user.PublicDescription); desc != "" {
+			fmt.Fprintf(&b, "   %s\n", ellipsize(desc, previewRunes))
+		}
+	}
+
+	writeCursor(&b, list.After)
+
+	return b.String()
+}
+
+func userFlags(user reddit.User) string {
 	flags := make([]string, 0, 3)
+
 	if user.IsMod {
 		flags = append(flags, "moderator")
 	}
@@ -279,22 +370,14 @@ func renderUser(user *reddit.User) string {
 		flags = append(flags, "reddit employee")
 	}
 
-	if len(flags) > 0 {
-		fmt.Fprintf(&b, "%s\n", strings.Join(flags, " · "))
-	}
-
-	if user.PublicDescription != "" {
-		fmt.Fprintf(&b, "\n%s\n", user.PublicDescription)
-	}
-
-	return b.String()
+	return strings.Join(flags, " · ")
 }
 
-func writeHeader(b *strings.Builder, header string, count int, noun, source, note string) {
+func writeHeader(b *strings.Builder, header string, count int, noun, dataSource, note string) {
 	fmt.Fprintf(b, "%s — %d %s", header, count, plural(noun, count))
 
-	if source != "" {
-		fmt.Fprintf(b, " (source: %s)", source)
+	if dataSource != reddit.SourceAPI {
+		fmt.Fprintf(b, " (%s)", dataSource)
 	}
 
 	b.WriteString("\n")

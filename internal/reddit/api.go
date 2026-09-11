@@ -15,29 +15,33 @@ const (
 	defaultLimit = 25
 	maxLimit     = 100
 	maxDepth     = 10
-	// maxBatchIDs matches what /by_id accepts comfortably in a single URL.
+	// maxBatchIDs is what /by_id takes comfortably in one URL.
 	maxBatchIDs = 50
+	// maxSubreddits bounds a combined r/a+b+c listing.
+	maxSubreddits = 20
 )
 
 var (
-	postSorts    = []string{"hot", "new", "top", "rising", "controversial"}
-	searchSorts  = []string{"relevance", "hot", "new", "top", "comments"}
-	userSorts    = []string{"new", "top", "hot", "controversial"}
-	commentSorts = []string{"best", "top", "new", "controversial", "old", "qa"}
-	timeFilters  = []string{"hour", "day", "week", "month", "year", "all"}
+	postSorts      = []string{"hot", "new", "top", "rising", "controversial"}
+	searchSorts    = []string{"relevance", "hot", "new", "top", "comments"}
+	userSorts      = []string{"new", "top", "hot", "controversial"}
+	commentSorts   = []string{"best", "top", "new", "controversial", "old", "qa"}
+	timeFilters    = []string{"hour", "day", "week", "month", "year", "all"}
+	subredditFinds = []string{"search", "popular", "new"}
 )
 
+// --- listings ------------------------------------------------------------
+
+// BrowseSubreddit lists posts from one or more subreddits. Several names
+// combine into a single request, which is both cheaper against the rate limit
+// and the only way to get a merged ranking across communities. "all" and
+// "popular" are the site-wide feeds.
 func (c *Client) BrowseSubreddit(
-	ctx context.Context,
-	subreddit,
-	sort,
-	timeFilter,
-	after string,
-	limit int,
+	ctx context.Context, subreddits, sort, timeFilter, after string, limit int,
 ) (*PostList, error) {
-	name := normalizeSubreddit(subreddit)
-	if name == "" {
-		return nil, errors.New("subreddit is required")
+	name, err := normalizeSubreddits(subreddits)
+	if err != nil {
+		return nil, err
 	}
 
 	sort = defaultTo(sort, "hot")
@@ -49,12 +53,7 @@ func (c *Client) BrowseSubreddit(
 		return nil, err
 	}
 
-	path, err := url.JoinPath("/r", name, sort)
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, listingParams(after, limit, sort, timeFilter))
+	body, err := c.get(ctx, "/r/"+name+"/"+sort, listingParams(after, limit, sort, timeFilter))
 	if err != nil {
 		if !IsBlocked(err) {
 			return nil, fmt.Errorf("browse subreddit: %w", err)
@@ -71,42 +70,8 @@ func (c *Client) BrowseSubreddit(
 	return list, nil
 }
 
-func (c *Client) Frontpage(
-	ctx context.Context, sort, timeFilter, after string, limit int,
-) (*PostList, error) {
-	sort = defaultTo(sort, "hot")
-	if err := validate("sort", sort, postSorts); err != nil {
-		return nil, err
-	}
-
-	if err := validateTimeFilter(timeFilter); err != nil {
-		return nil, err
-	}
-
-	path, err := url.JoinPath("/", sort)
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, listingParams(after, limit, sort, timeFilter))
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("frontpage: %w", err)
-		}
-
-		return c.postsFromRSS(ctx, "/"+sort+"/.rss", rssParams(limit, sort, timeFilter))
-	}
-
-	list, err := decodePostListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("frontpage: %w", err)
-	}
-
-	return list, nil
-}
-
 func (c *Client) SearchReddit(
-	ctx context.Context, query, subreddit, sort, timeFilter, after string, limit int,
+	ctx context.Context, query, subreddits, sort, timeFilter, after string, limit int,
 ) (*PostList, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, errors.New("query is required")
@@ -122,48 +87,35 @@ func (c *Client) SearchReddit(
 		return nil, err
 	}
 
-	name := normalizeSubreddit(subreddit)
+	path, rssPath := "/search", "/search.rss"
 
-	path := "/search"
-	rssPath := "/search.rss"
-
-	if name != "" {
-		var err error
-
-		path, err = url.JoinPath("/r", name, "search")
+	if strings.TrimSpace(subreddits) != "" {
+		name, err := normalizeSubreddits(subreddits)
 		if err != nil {
-			return nil, fmt.Errorf("build path: %w", err)
+			return nil, err
 		}
 
-		rssPath = "/r/" + name + "/search.rss"
+		path, rssPath = "/r/"+name+"/search", "/r/"+name+"/search.rss"
 	}
 
 	params := url.Values{}
 	params.Set("q", query)
 	params.Set("limit", strconv.Itoa(clampLimit(limit)))
+	setIfNotEmpty(params, "sort", sort)
+	setIfNotEmpty(params, "t", timeFilter)
 
-	if name != "" {
+	if path != "/search" {
 		params.Set("restrict_sr", "1")
 	}
 
-	setIfNotEmpty(params, "sort", sort)
-	setIfNotEmpty(params, "t", timeFilter)
+	rssQuery := cloneValues(params)
+
 	setIfNotEmpty(params, "after", after)
 
 	body, err := c.get(ctx, path, params)
 	if err != nil {
 		if !IsBlocked(err) {
 			return nil, fmt.Errorf("search reddit: %w", err)
-		}
-
-		rssQuery := url.Values{}
-		rssQuery.Set("q", query)
-		rssQuery.Set("limit", strconv.Itoa(clampLimit(limit)))
-		setIfNotEmpty(rssQuery, "sort", sort)
-		setIfNotEmpty(rssQuery, "t", timeFilter)
-
-		if name != "" {
-			rssQuery.Set("restrict_sr", "1")
 		}
 
 		return c.postsFromRSS(ctx, rssPath, rssQuery)
@@ -177,22 +129,71 @@ func (c *Client) SearchReddit(
 	return list, nil
 }
 
-func (c *Client) GetPost(ctx context.Context, postID string) (*Post, error) {
-	posts, err := c.GetPosts(ctx, []string{postID})
-	if err != nil {
+// BrowseComments reads a comment stream: every recent comment in a subreddit,
+// or every recent comment by a user. The subreddit stream is the only way to
+// see what a community is saying without picking threads first.
+func (c *Client) BrowseComments(
+	ctx context.Context, subreddit, username, sort, timeFilter, after string, limit int,
+) (*CommentList, error) {
+	var path, rssPath string
+
+	switch {
+	case strings.TrimSpace(subreddit) != "" && strings.TrimSpace(username) != "":
+		return nil, errors.New("pass either subreddit or username, not both")
+	case strings.TrimSpace(subreddit) != "":
+		name, err := normalizeSubreddits(subreddit)
+		if err != nil {
+			return nil, err
+		}
+
+		path, rssPath = "/r/"+name+"/comments", "/r/"+name+"/comments/.rss"
+	case strings.TrimSpace(username) != "":
+		name, err := normalizeUsername(username)
+		if err != nil {
+			return nil, err
+		}
+
+		path, rssPath = "/user/"+name+"/comments", "/user/"+name+"/comments/.rss"
+	default:
+		return nil, errors.New("subreddit or username is required")
+	}
+
+	if sort != "" {
+		if err := validate("sort", sort, userSorts); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := validateTimeFilter(timeFilter); err != nil {
 		return nil, err
 	}
 
-	if len(posts.Posts) == 0 {
-		return nil, fmt.Errorf("post %q not found", postID)
+	body, err := c.get(ctx, path, userListingParams(after, limit, sort, timeFilter))
+	if err != nil {
+		if !IsBlocked(err) {
+			return nil, fmt.Errorf("browse comments: %w", err)
+		}
+
+		raw, rerr := c.getRSS(ctx, rssPath, rssParams(limit, sort, timeFilter))
+		if rerr != nil {
+			return nil, fmt.Errorf("browse comments (rss): %w", rerr)
+		}
+
+		return parseRSSComments(raw, c.listingText)
 	}
 
-	return &posts.Posts[0], nil
+	list, err := decodeCommentListing(body, c.listingText)
+	if err != nil {
+		return nil, fmt.Errorf("browse comments: %w", err)
+	}
+
+	return list, nil
 }
 
-// GetPosts fetches several posts in one request. Reddit's /by_id takes a
-// comma-separated list of fullnames, which turns "look at these ten links" from
-// ten requests against a 100/minute budget into one.
+// --- posts ---------------------------------------------------------------
+
+// GetPosts fetches posts by id. Reddit's /by_id takes a comma-separated list,
+// so "look at these ten links" costs one request rather than ten.
 func (c *Client) GetPosts(ctx context.Context, postIDs []string) (*PostList, error) {
 	if len(postIDs) == 0 {
 		return nil, errors.New("post_ids is required")
@@ -213,12 +214,7 @@ func (c *Client) GetPosts(ctx context.Context, postIDs []string) (*PostList, err
 		fullnames = append(fullnames, "t3_"+id)
 	}
 
-	path, err := url.JoinPath("/by_id", strings.Join(fullnames, ","))
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, nil)
+	body, err := c.get(ctx, "/by_id/"+strings.Join(fullnames, ","), nil)
 	if err != nil {
 		if !IsBlocked(err) {
 			return nil, fmt.Errorf("get posts: %w", err)
@@ -235,9 +231,76 @@ func (c *Client) GetPosts(ctx context.Context, postIDs []string) (*PostList, err
 	return list, nil
 }
 
-// GetPostComments returns a post with its comment tree. When commentID is set,
-// Reddit returns that comment's subtree instead of the whole thread, which is
-// how a caller expands the branches reported in CommentList.MoreParentIDs.
+// FindPostsByURL answers "did anyone post this link, and what did they say".
+// Reddit indexes submissions by their target URL, which no search query reaches
+// reliably.
+func (c *Client) FindPostsByURL(ctx context.Context, target string, limit int) (*PostList, error) {
+	if strings.TrimSpace(target) == "" {
+		return nil, errors.New("url is required")
+	}
+
+	if _, err := url.ParseRequestURI(target); err != nil {
+		return nil, fmt.Errorf("url %q is not a valid absolute URL: %w", target, err)
+	}
+
+	params := url.Values{}
+	params.Set("url", target)
+	params.Set("limit", strconv.Itoa(clampLimit(limit)))
+
+	body, err := c.get(ctx, "/api/info", params)
+	if err != nil {
+		return nil, fmt.Errorf("find posts by url: %w", err)
+	}
+
+	list, err := decodePostListing(body, c.listingText)
+	if err != nil {
+		return nil, fmt.Errorf("find posts by url: %w", err)
+	}
+
+	return list, nil
+}
+
+// FindDuplicates lists the other threads discussing the same link, which is
+// where a story's actual discussion often lives once a repost outgrows the
+// original.
+func (c *Client) FindDuplicates(ctx context.Context, postID, after string, limit int) (*PostList, error) {
+	id, err := normalizePostID(postID)
+	if err != nil {
+		return nil, err
+	}
+
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(clampLimit(limit)))
+	setIfNotEmpty(params, "after", after)
+
+	body, err := c.get(ctx, "/duplicates/"+id, params)
+	if err != nil {
+		return nil, fmt.Errorf("find duplicates: %w", err)
+	}
+
+	// Two listings: the original post, then the duplicates.
+	var pair []json.RawMessage
+	if err := json.Unmarshal(body, &pair); err != nil {
+		return nil, fmt.Errorf("decode duplicates: %w", err)
+	}
+
+	const wantListings = 2
+	if len(pair) < wantListings {
+		return nil, fmt.Errorf("unexpected duplicates response (got %d listings, want %d)",
+			len(pair), wantListings)
+	}
+
+	list, err := decodePostListing(pair[1], c.listingText)
+	if err != nil {
+		return nil, fmt.Errorf("find duplicates: %w", err)
+	}
+
+	return list, nil
+}
+
+// GetPostComments returns a post with its comment tree. With commentID set,
+// Reddit returns that comment's subtree instead, which is how the branches in
+// CommentList.MoreParentIDs get expanded.
 func (c *Client) GetPostComments(
 	ctx context.Context, postID, commentID, commentSort string, limit, depth int,
 ) (*Post, *CommentList, error) {
@@ -270,12 +333,7 @@ func (c *Client) GetPostComments(
 		params.Set("context", "0")
 	}
 
-	path, err := url.JoinPath("/comments", id)
-	if err != nil {
-		return nil, nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, params)
+	body, err := c.get(ctx, "/comments/"+id, params)
 	if err != nil {
 		if !IsBlocked(err) {
 			return nil, nil, fmt.Errorf("get post comments: %w", err)
@@ -284,7 +342,7 @@ func (c *Client) GetPostComments(
 		return c.commentsFromRSS(ctx, id, clampLimit(limit))
 	}
 
-	post, comments, err := decodeCommentsEnvelope(body, 0)
+	post, comments, err := decodeCommentsEnvelope(body, c.commentText)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get post comments: %w", err)
 	}
@@ -323,18 +381,123 @@ func decodeCommentsEnvelope(body json.RawMessage, maxText int) (*Post, *CommentL
 	return &postList.Posts[0], comments, nil
 }
 
-func (c *Client) GetUser(ctx context.Context, username string) (*User, error) {
-	name := normalizeUsername(username)
-	if name == "" {
-		return nil, errors.New("username is required")
+// --- communities ---------------------------------------------------------
+
+// FindSubreddits discovers communities: by query, or by browsing the popular
+// and newly created lists when no query is given.
+func (c *Client) FindSubreddits(ctx context.Context, query, sort, after string, limit int) (*SubredditList, error) {
+	sort = defaultTo(sort, "search")
+	if err := validate("sort", sort, subredditFinds); err != nil {
+		return nil, err
 	}
 
-	path, err := url.JoinPath("/user", name, "about")
+	if sort == "search" && strings.TrimSpace(query) == "" {
+		return nil, errors.New(`query is required when sort is "search"`)
+	}
+
+	params := url.Values{}
+	params.Set("limit", strconv.Itoa(clampLimit(limit)))
+	setIfNotEmpty(params, "after", after)
+
+	path := "/subreddits/" + sort
+	rssPath := "/subreddits/" + sort + ".rss"
+	rssQuery := url.Values{"limit": []string{strconv.Itoa(clampLimit(limit))}}
+
+	if sort == "search" {
+		params.Set("q", query)
+		rssQuery.Set("q", query)
+	}
+
+	body, err := c.get(ctx, path, params)
 	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
+		if !IsBlocked(err) {
+			return nil, fmt.Errorf("find subreddits: %w", err)
+		}
+
+		return c.subredditsFromRSS(ctx, rssPath, rssQuery)
 	}
 
-	body, err := c.get(ctx, path, nil)
+	list, err := decodeSubredditListing(body)
+	if err != nil {
+		return nil, fmt.Errorf("find subreddits: %w", err)
+	}
+
+	return list, nil
+}
+
+func (c *Client) GetSubredditInfo(ctx context.Context, name string, includeRules bool) (*Subreddit, error) {
+	sub, err := normalizeSubreddit(name)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := c.get(ctx, "/r/"+sub+"/about", nil)
+	if err != nil {
+		if !IsBlocked(err) {
+			return nil, fmt.Errorf("get subreddit info: %w", err)
+		}
+
+		return c.subredditFromRSS(ctx, sub)
+	}
+
+	var wrap struct {
+		Kind string       `json:"kind"`
+		Data rawSubreddit `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &wrap); err != nil {
+		return nil, fmt.Errorf("decode subreddit: %w", err)
+	}
+
+	info := wrap.Data.toSubreddit()
+
+	if includeRules {
+		rulesBody, rerr := c.get(ctx, "/r/"+sub+"/about/rules", nil)
+		if rerr != nil {
+			return nil, fmt.Errorf("get subreddit rules: %w", rerr)
+		}
+
+		rules, rerr := decodeRules(rulesBody)
+		if rerr != nil {
+			return nil, rerr
+		}
+
+		info.Rules = rules
+	}
+
+	return &info, nil
+}
+
+// GetWikiPage reads a subreddit's wiki. Communities keep their FAQs, guides and
+// recommendation lists there, and none of it appears in any listing.
+func (c *Client) GetWikiPage(ctx context.Context, subreddit, page string) (*WikiPage, error) {
+	sub, err := normalizeSubreddit(subreddit)
+	if err != nil {
+		return nil, err
+	}
+
+	name, err := normalizeWikiPage(page)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := c.get(ctx, "/r/"+sub+"/wiki/"+name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get wiki page: %w", err)
+	}
+
+	return decodeWikiPage(body, sub, name)
+}
+
+// --- users ---------------------------------------------------------------
+
+func (c *Client) GetUser(ctx context.Context, username string) (*User, error) {
+	name, err := normalizeUsername(username)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := c.get(ctx, "/user/"+name+"/about", nil)
 	if err != nil {
 		return nil, fmt.Errorf("get user: %w", err)
 	}
@@ -353,12 +516,35 @@ func (c *Client) GetUser(ctx context.Context, username string) (*User, error) {
 	return &user, nil
 }
 
+func (c *Client) SearchUsers(ctx context.Context, query, after string, limit int) (*UserList, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, errors.New("query is required")
+	}
+
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("limit", strconv.Itoa(clampLimit(limit)))
+	setIfNotEmpty(params, "after", after)
+
+	body, err := c.get(ctx, "/users/search", params)
+	if err != nil {
+		return nil, fmt.Errorf("search users: %w", err)
+	}
+
+	list, err := decodeUserListing(body)
+	if err != nil {
+		return nil, fmt.Errorf("search users: %w", err)
+	}
+
+	return list, nil
+}
+
 func (c *Client) GetUserPosts(
 	ctx context.Context, username, sort, timeFilter, after string, limit int,
 ) (*PostList, error) {
-	name := normalizeUsername(username)
-	if name == "" {
-		return nil, errors.New("username is required")
+	name, err := normalizeUsername(username)
+	if err != nil {
+		return nil, err
 	}
 
 	if sort != "" {
@@ -371,12 +557,7 @@ func (c *Client) GetUserPosts(
 		return nil, err
 	}
 
-	path, err := url.JoinPath("/user", name, "submitted")
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, userListingParams(after, limit, sort, timeFilter))
+	body, err := c.get(ctx, "/user/"+name+"/submitted", userListingParams(after, limit, sort, timeFilter))
 	if err != nil {
 		if !IsBlocked(err) {
 			return nil, fmt.Errorf("get user posts: %w", err)
@@ -388,140 +569,6 @@ func (c *Client) GetUserPosts(
 	list, err := decodePostListing(body, c.listingText)
 	if err != nil {
 		return nil, fmt.Errorf("get user posts: %w", err)
-	}
-
-	return list, nil
-}
-
-func (c *Client) GetUserComments(
-	ctx context.Context, username, sort, timeFilter, after string, limit int,
-) (*CommentList, error) {
-	name := normalizeUsername(username)
-	if name == "" {
-		return nil, errors.New("username is required")
-	}
-
-	if sort != "" {
-		if err := validate("sort", sort, userSorts); err != nil {
-			return nil, err
-		}
-	}
-
-	if err := validateTimeFilter(timeFilter); err != nil {
-		return nil, err
-	}
-
-	path, err := url.JoinPath("/user", name, "comments")
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, userListingParams(after, limit, sort, timeFilter))
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("get user comments: %w", err)
-		}
-
-		raw, rerr := c.getRSS(ctx, "/user/"+name+"/comments/.rss", rssParams(limit, sort, timeFilter))
-		if rerr != nil {
-			return nil, fmt.Errorf("get user comments (rss): %w", rerr)
-		}
-
-		return parseRSSComments(raw, c.listingText)
-	}
-
-	list, err := decodeCommentListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("get user comments: %w", err)
-	}
-
-	return list, nil
-}
-
-func (c *Client) GetSubredditInfo(ctx context.Context, name string) (*Subreddit, error) {
-	sub := normalizeSubreddit(name)
-	if sub == "" {
-		return nil, errors.New("subreddit is required")
-	}
-
-	path, err := url.JoinPath("/r", sub, "about")
-	if err != nil {
-		return nil, fmt.Errorf("build path: %w", err)
-	}
-
-	body, err := c.get(ctx, path, nil)
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("get subreddit info: %w", err)
-		}
-
-		return c.subredditFromRSS(ctx, sub)
-	}
-
-	var wrap struct {
-		Kind string       `json:"kind"`
-		Data rawSubreddit `json:"data"`
-	}
-
-	if err := json.Unmarshal(body, &wrap); err != nil {
-		return nil, fmt.Errorf("decode subreddit: %w", err)
-	}
-
-	sr := wrap.Data.toSubreddit()
-
-	return &sr, nil
-}
-
-func (c *Client) TrendingSubreddits(ctx context.Context, after string, limit int) (*SubredditList, error) {
-	params := url.Values{}
-	params.Set("limit", strconv.Itoa(clampLimit(limit)))
-	setIfNotEmpty(params, "after", after)
-
-	body, err := c.get(ctx, "/subreddits/popular", params)
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("trending subreddits: %w", err)
-		}
-
-		return c.subredditsFromRSS(ctx, "/subreddits/popular.rss", rssParams(limit, "", ""))
-	}
-
-	list, err := decodeSubredditListing(body)
-	if err != nil {
-		return nil, fmt.Errorf("trending subreddits: %w", err)
-	}
-
-	return list, nil
-}
-
-// SearchSubreddits finds communities by name or topic, which is the step before
-// browsing: "where is this discussed" cannot be answered by a trending list.
-func (c *Client) SearchSubreddits(ctx context.Context, query, after string, limit int) (*SubredditList, error) {
-	if strings.TrimSpace(query) == "" {
-		return nil, errors.New("query is required")
-	}
-
-	params := url.Values{}
-	params.Set("q", query)
-	params.Set("limit", strconv.Itoa(clampLimit(limit)))
-	setIfNotEmpty(params, "after", after)
-
-	body, err := c.get(ctx, "/subreddits/search", params)
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("search subreddits: %w", err)
-		}
-
-		rssQuery := url.Values{}
-		rssQuery.Set("q", query)
-		rssQuery.Set("limit", strconv.Itoa(clampLimit(limit)))
-
-		return c.subredditsFromRSS(ctx, "/subreddits/search.rss", rssQuery)
-	}
-
-	list, err := decodeSubredditListing(body)
-	if err != nil {
-		return nil, fmt.Errorf("search subreddits: %w", err)
 	}
 
 	return list, nil
@@ -549,7 +596,7 @@ func (c *Client) subredditsFromRSS(ctx context.Context, path string, params url.
 
 // subredditFromRSS reconstructs what it can of a subreddit's metadata from its
 // listing feed. There is no about.rss, so subscriber and activity counts are
-// simply not available without credentials.
+// simply unavailable without credentials.
 func (c *Client) subredditFromRSS(ctx context.Context, name string) (*Subreddit, error) {
 	raw, err := c.getRSS(ctx, "/r/"+name+"/.rss", url.Values{"limit": []string{"1"}})
 	if err != nil {
@@ -588,7 +635,7 @@ func (c *Client) commentsFromRSS(ctx context.Context, postID string, limit int) 
 		return nil, nil, fmt.Errorf("post %q not found", postID)
 	}
 
-	comments, err := parseRSSComments(raw, 0)
+	comments, err := parseRSSComments(raw, c.commentText)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -596,10 +643,10 @@ func (c *Client) commentsFromRSS(ctx context.Context, postID string, limit int) 
 	return &posts.Posts[0], comments, nil
 }
 
-// postsFromCommentFeeds is the batch fallback: /by_id has no RSS equivalent, so
-// each post costs one feed request.
+// postsFromCommentFeeds is the batch fallback: /by_id has no feed equivalent,
+// so each post costs one request.
 func (c *Client) postsFromCommentFeeds(ctx context.Context, fullnames []string) (*PostList, error) {
-	out := &PostList{DataSource: SourceRSS, Note: rssNote, Posts: []Post{}}
+	out := &PostList{source: rssSource()}
 
 	for _, fullname := range fullnames {
 		id := strings.TrimPrefix(fullname, "t3_")
@@ -620,7 +667,7 @@ func (c *Client) postsFromCommentFeeds(ctx context.Context, fullnames []string) 
 	return out, nil
 }
 
-// --- parameters and normalization ---------------------------------------
+// --- parameters ----------------------------------------------------------
 
 func listingParams(after string, limit int, sort, timeFilter string) url.Values {
 	params := url.Values{}
@@ -644,8 +691,8 @@ func userListingParams(after string, limit int, sort, timeFilter string) url.Val
 	return params
 }
 
-// rssParams mirrors listingParams for the feeds, which accept limit, sort and t
-// but have no cursor: Atom feeds are not paginated.
+// rssParams mirrors the listing parameters the feeds accept. They have no
+// cursor: Atom feeds are not paginated.
 func rssParams(limit int, sort, timeFilter string) url.Values {
 	params := url.Values{}
 	params.Set("limit", strconv.Itoa(clampLimit(limit)))
@@ -655,6 +702,15 @@ func rssParams(limit int, sort, timeFilter string) url.Values {
 	}
 
 	return params
+}
+
+func cloneValues(in url.Values) url.Values {
+	out := url.Values{}
+	for key, values := range in {
+		out[key] = append([]string(nil), values...)
+	}
+
+	return out
 }
 
 func setIfNotEmpty(params url.Values, key, value string) {
@@ -705,33 +761,101 @@ func clampDepth(depth int) int {
 	return min(depth, maxDepth)
 }
 
-func normalizeSubreddit(name string) string {
-	name = strings.TrimSpace(name)
-	name = strings.TrimPrefix(name, "/")
-	name = strings.TrimPrefix(name, "r/")
-
-	return strings.Trim(name, "/")
-}
-
-func normalizeUsername(name string) string {
-	name = strings.TrimSpace(name)
-	name = strings.TrimPrefix(name, "/")
-	name = strings.TrimPrefix(name, "u/")
-	name = strings.TrimPrefix(name, "user/")
-
-	return strings.Trim(name, "/")
-}
+// --- normalization -------------------------------------------------------
 
 var (
-	// commentsPathRE finds the post id inside any reddit.com permalink, including
-	// a comment permalink, where the post id is still the /comments/ segment.
+	// Names go straight into the request path, so they are validated against
+	// Reddit's own character sets rather than escaped and hoped for.
+	subredditRE = regexp.MustCompile(`^[A-Za-z0-9_]{2,25}$`)
+	usernameRE  = regexp.MustCompile(`^[A-Za-z0-9_-]{2,20}$`)
+	wikiPageRE  = regexp.MustCompile(`^[A-Za-z0-9_/-]{1,100}$`)
+	// commentsPathRE finds the post id inside any reddit.com permalink,
+	// including a comment permalink, where /comments/ still names the post.
 	commentsPathRE = regexp.MustCompile(`(?i)/comments/([a-z0-9]+)`)
 	base36RE       = regexp.MustCompile(`(?i)^[a-z0-9]{2,16}$`)
+	subSplitRE     = regexp.MustCompile(`[+,\s]+`)
 )
 
+func normalizeSubreddit(name string) (string, error) {
+	clean := strings.Trim(strings.TrimSpace(name), "/")
+	clean = strings.TrimPrefix(clean, "r/")
+	clean = strings.Trim(clean, "/")
+
+	if clean == "" {
+		return "", errors.New("subreddit is required")
+	}
+
+	if !subredditRE.MatchString(clean) {
+		return "", fmt.Errorf("%q is not a subreddit name (letters, digits and underscore, 2-25 chars)", name)
+	}
+
+	return clean, nil
+}
+
+// normalizeSubreddits accepts one name or several, separated by +, commas or
+// spaces, and returns Reddit's a+b+c form.
+func normalizeSubreddits(names string) (string, error) {
+	fields := subSplitRE.Split(strings.TrimSpace(names), -1)
+
+	out := make([]string, 0, len(fields))
+
+	for _, field := range fields {
+		if field == "" {
+			continue
+		}
+
+		name, err := normalizeSubreddit(field)
+		if err != nil {
+			return "", err
+		}
+
+		out = append(out, name)
+	}
+
+	if len(out) == 0 {
+		return "", errors.New("subreddit is required")
+	}
+
+	if len(out) > maxSubreddits {
+		return "", fmt.Errorf("too many subreddits: %d (max %d)", len(out), maxSubreddits)
+	}
+
+	return strings.Join(out, "+"), nil
+}
+
+func normalizeUsername(name string) (string, error) {
+	clean := strings.Trim(strings.TrimSpace(name), "/")
+	clean = strings.TrimPrefix(clean, "user/")
+	clean = strings.TrimPrefix(clean, "u/")
+	clean = strings.Trim(clean, "/")
+
+	if clean == "" {
+		return "", errors.New("username is required")
+	}
+
+	if !usernameRE.MatchString(clean) {
+		return "", fmt.Errorf("%q is not a username (letters, digits, underscore and dash, 2-20 chars)", name)
+	}
+
+	return clean, nil
+}
+
+func normalizeWikiPage(page string) (string, error) {
+	clean := strings.Trim(strings.TrimSpace(page), "/")
+	if clean == "" {
+		return "index", nil
+	}
+
+	if !wikiPageRE.MatchString(clean) {
+		return "", fmt.Errorf("%q is not a wiki page path", page)
+	}
+
+	return clean, nil
+}
+
 // normalizePostID accepts everything a model is likely to be holding: a bare
-// id, a t3_ fullname, a full permalink, a comment permalink or a redd.it short
-// link. Models work from URLs far more often than from base36 ids.
+// id, a t3_ fullname, a permalink, a comment permalink or a redd.it link.
+// Models work from URLs far more often than from base36 ids.
 func normalizePostID(raw string) (string, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
@@ -759,7 +883,7 @@ func normalizePostID(raw string) (string, error) {
 				"a reddit.com permalink or a redd.it link", raw)
 	}
 
-	return strings.ToLower(value), nil
+	return value, nil
 }
 
 func normalizeCommentID(raw string) (string, error) {
@@ -776,5 +900,5 @@ func normalizeCommentID(raw string) (string, error) {
 		return "", fmt.Errorf("cannot read a comment id from %q: pass a base36 id or a t1_ fullname", raw)
 	}
 
-	return strings.ToLower(value), nil
+	return value, nil
 }

@@ -104,6 +104,7 @@ func run(transportFlag string) error {
 		CacheTTL:         cfg.CacheTTL,
 		CacheMaxBytes:    cfg.CacheMaxBytes(),
 		ListingTextChars: cfg.ListingTextChars,
+		CommentTextChars: cfg.CommentTextChars,
 		Logger:           logger,
 	})
 

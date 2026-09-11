@@ -71,12 +71,23 @@ func TestParseRSSPosts(t *testing.T) {
 	}
 
 	link := list.Posts[1]
-	if link.URL != "https://go.dev/blog/generics" {
+	if !strings.HasPrefix(link.URL, "https://rustfoundation.org/") {
 		t.Errorf("link post url = %q, want the submitted link", link.URL)
 	}
 
 	if link.IsSelf {
 		t.Error("a post linking elsewhere is not a self post")
+	}
+
+	if link.Subreddit != "rust" {
+		t.Errorf("subreddit = %q, want rust: a combined feed mixes communities", link.Subreddit)
+	}
+
+	// A link post has no body. Everything in its entry is Reddit's chrome —
+	// thumbnail, "submitted by … to …", [link] and [comments] — and letting any
+	// of it through would read as the post's text.
+	if link.Selftext != "" {
+		t.Errorf("link post selftext should be empty, got %q", link.Selftext)
 	}
 }
 
@@ -167,6 +178,18 @@ func TestParseRSSSubreddits(t *testing.T) {
 
 	if list.Subreddits[0].Subscribers != nil {
 		t.Error("rss subreddits have no subscriber count")
+	}
+}
+
+func TestSubredditDescriptionDropsChrome(t *testing.T) {
+	list, err := parseRSSSubreddits(readFixture(t, "subreddits_feed.xml"))
+	if err != nil {
+		t.Fatalf("parseRSSSubreddits: %v", err)
+	}
+
+	// A subreddit entry with nothing but a [link] anchor has no description.
+	if got := list.Subreddits[0].Description; got != "" {
+		t.Errorf("description = %q, want empty", got)
 	}
 }
 

@@ -59,8 +59,8 @@ func TestNormalizePostIDErrorExplainsAcceptedForms(t *testing.T) {
 
 func TestNormalizeCommentID(t *testing.T) {
 	cases := map[string]string{
-		"p8l0z29":     "p8l0z29",
-		"t1_p8l0z29":  "p8l0z29",
+		"p8l0z29":    "p8l0z29",
+		"t1_p8l0z29": "p8l0z29",
 		"https://www.reddit.com/r/golang/comments/1wa14q6/t/p8l0z29/": "p8l0z29",
 	}
 
@@ -78,15 +78,97 @@ func TestNormalizeCommentID(t *testing.T) {
 
 func TestNormalizeSubredditAndUsername(t *testing.T) {
 	for input, want := range map[string]string{"golang": "golang", "r/golang": "golang", "/r/golang/": "golang"} {
-		if got := normalizeSubreddit(input); got != want {
+		got, err := normalizeSubreddit(input)
+		if err != nil {
+			t.Fatalf("normalizeSubreddit(%q): %v", input, err)
+		}
+
+		if got != want {
 			t.Errorf("normalizeSubreddit(%q) = %q, want %q", input, got, want)
 		}
 	}
 
 	for input, want := range map[string]string{"spez": "spez", "u/spez": "spez", "/user/spez/": "spez"} {
-		if got := normalizeUsername(input); got != want {
+		got, err := normalizeUsername(input)
+		if err != nil {
+			t.Fatalf("normalizeUsername(%q): %v", input, err)
+		}
+
+		if got != want {
 			t.Errorf("normalizeUsername(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// Names are concatenated into the request path, so anything that could change
+// the path's shape has to be refused rather than escaped.
+func TestNormalizeRejectsPathInjection(t *testing.T) {
+	for _, input := range []string{"", "golang/../admin", "a b", "gol@ng", "x", "../../etc"} {
+		if got, err := normalizeSubreddit(input); err == nil {
+			t.Errorf("normalizeSubreddit(%q) = %q, want an error", input, got)
+		}
+	}
+
+	for _, input := range []string{"", "spez/about", "sp ez", "sp@ez"} {
+		if got, err := normalizeUsername(input); err == nil {
+			t.Errorf("normalizeUsername(%q) = %q, want an error", input, got)
+		}
+	}
+}
+
+func TestNormalizeSubreddits(t *testing.T) {
+	cases := map[string]string{
+		"golang":            "golang",
+		"golang+rust":       "golang+rust",
+		"r/golang, r/rust":  "golang+rust",
+		"golang rust cpp":   "golang+rust+cpp",
+		" r/golang + rust ": "golang+rust",
+		"all":               "all",
+	}
+
+	for input, want := range cases {
+		got, err := normalizeSubreddits(input)
+		if err != nil {
+			t.Fatalf("normalizeSubreddits(%q): %v", input, err)
+		}
+
+		if got != want {
+			t.Errorf("normalizeSubreddits(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	if _, err := normalizeSubreddits(""); err == nil {
+		t.Error("an empty subreddit list should be rejected")
+	}
+
+	many := make([]string, maxSubreddits+1)
+	for i := range many {
+		many[i] = "sub" + string(rune('a'+i%26)) + "x"
+	}
+
+	if _, err := normalizeSubreddits(strings.Join(many, "+")); err == nil {
+		t.Error("too many subreddits should be rejected")
+	}
+}
+
+func TestNormalizeWikiPage(t *testing.T) {
+	for input, want := range map[string]string{
+		"":              "index",
+		"index":         "index",
+		"/faq/posting/": "faq/posting",
+	} {
+		got, err := normalizeWikiPage(input)
+		if err != nil {
+			t.Fatalf("normalizeWikiPage(%q): %v", input, err)
+		}
+
+		if got != want {
+			t.Errorf("normalizeWikiPage(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	if _, err := normalizeWikiPage("faq?x=1"); err == nil {
+		t.Error("a wiki path with a query should be rejected")
 	}
 }
 
@@ -150,6 +232,18 @@ func TestDecodeCommentListingReportsCollapsedReplies(t *testing.T) {
 	// t3_ parents mean "more top-level comments", which comment_id cannot expand.
 	if len(list.MoreParentIDs) != 1 || list.MoreParentIDs[0] != "a1" {
 		t.Errorf("more_parent_ids = %v, want [a1]", list.MoreParentIDs)
+	}
+}
+
+func TestFindSubredditsRequiresQueryForSearch(t *testing.T) {
+	client := New(Options{})
+
+	if _, err := client.FindSubreddits(t.Context(), "", "search", "", 5); err == nil {
+		t.Error("searching for nothing should be refused before spending a request")
+	}
+
+	if err := validate("sort", "sideways", subredditFinds); err == nil {
+		t.Error("an unknown subreddit sort should be rejected")
 	}
 }
 

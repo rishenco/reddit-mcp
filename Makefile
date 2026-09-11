@@ -1,8 +1,7 @@
 BIN := bin/reddit-mcp
-DIST := dist
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: build install test lint dist clean up
+.PHONY: build install test lint clean up
 
 build:
 	go build -trimpath -ldflags "-X main.version=$(VERSION)" -o $(BIN) ./cmd/reddit-mcp
@@ -16,12 +15,8 @@ test:
 lint:
 	golangci-lint run
 
-# Release archives for every supported platform, the same way CI builds them.
-dist:
-	VERSION=$(VERSION) DIST=$(DIST) ./scripts/build-dist.sh
-
 clean:
-	rm -rf $(BIN) $(DIST)
+	rm -rf $(BIN)
 
 up:
 	set -a && . ./.env && set +a && docker compose up -d --build

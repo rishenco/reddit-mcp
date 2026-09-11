@@ -7,106 +7,145 @@ import (
 	"unicode/utf8"
 )
 
-// DataSource records where a result came from. Anything but "api" is degraded:
-// the public RSS feeds carry no scores, comment counts or NSFW flags, and a
-// model that cannot see the difference will happily report a score of zero.
+// Results are rendered to text, not marshalled, so these types carry no JSON
+// tags. What they do carry is the distinction between "zero" and "unknown":
+// the RSS fallback genuinely does not know a post's score, and a plain int
+// would report that as no upvotes.
 const (
 	SourceAPI = "api"
 	SourceRSS = "rss"
 )
 
-const rssNote = "Served from Reddit's public RSS feed because logged-out Data API access is blocked. " +
-	"Scores, comment counts, ratios and NSFW flags are unavailable; set REDDIT_CLIENT_ID and " +
-	"REDDIT_CLIENT_SECRET for complete data."
+// rssNote is deliberately terse. The full explanation of what RSS costs lives
+// in the server instructions, which the client reads once, rather than in
+// every listing the model reads.
+const rssNote = "logged-out RSS fallback: no scores, counts, ratios or NSFW flags"
 
 type Post struct {
-	ID        string `json:"id"`
-	Subreddit string `json:"subreddit"`
-	Title     string `json:"title"`
-	Author    string `json:"author"`
-	URL       string `json:"url"`
-	Permalink string `json:"permalink"`
-	// Score, UpvoteRatio, NumComments and Over18 are pointers because the RSS
-	// fallback genuinely does not know them. Absent is honest; zero is a lie.
-	Score             *int     `json:"score,omitempty"`
-	UpvoteRatio       *float64 `json:"upvote_ratio,omitempty"`
-	NumComments       *int     `json:"num_comments,omitempty"`
-	CreatedUTC        int64    `json:"created_utc"`
-	IsSelf            bool     `json:"is_self,omitempty"`
-	Selftext          string   `json:"selftext,omitempty"`
-	SelftextTruncated bool     `json:"selftext_truncated,omitempty"`
-	Over18            *bool    `json:"over_18,omitempty"`
-	Stickied          bool     `json:"stickied,omitempty"`
-	Locked            bool     `json:"locked,omitempty"`
-	LinkFlairText     string   `json:"link_flair_text,omitempty"`
+	ID                string
+	Subreddit         string
+	Title             string
+	Author            string
+	URL               string
+	Permalink         string
+	Score             *int
+	UpvoteRatio       *float64
+	NumComments       *int
+	CreatedUTC        int64
+	IsSelf            bool
+	Selftext          string
+	SelftextTruncated bool
+	Over18            *bool
+	Stickied          bool
+	Locked            bool
+	LinkFlairText     string
 }
 
-// Comment is flattened: nested replies are emitted as separate entries
-// with ParentID and Depth set, to keep the output schema non-recursive.
+// Comment is flattened: nested replies are separate entries carrying ParentID
+// and Depth, so a deep thread renders as an indented list without recursion.
 type Comment struct {
-	ID            string `json:"id"`
-	ParentID      string `json:"parent_id,omitempty"`
-	Depth         int    `json:"depth"`
-	Author        string `json:"author"`
-	Body          string `json:"body"`
-	BodyTruncated bool   `json:"body_truncated,omitempty"`
-	Score         *int   `json:"score,omitempty"`
-	CreatedUTC    int64  `json:"created_utc"`
-	Permalink     string `json:"permalink"`
-	IsSubmitter   bool   `json:"is_submitter,omitempty"`
+	ID            string
+	ParentID      string
+	Depth         int
+	Subreddit     string
+	Author        string
+	Body          string
+	BodyTruncated bool
+	Score         *int
+	CreatedUTC    int64
+	Permalink     string
+	IsSubmitter   bool
 }
 
 type User struct {
-	Name              string `json:"name"`
-	ID                string `json:"id"`
-	CreatedUTC        int64  `json:"created_utc"`
-	LinkKarma         int    `json:"link_karma"`
-	CommentKarma      int    `json:"comment_karma"`
-	TotalKarma        int    `json:"total_karma"`
-	IsMod             bool   `json:"is_mod"`
-	IsGold            bool   `json:"is_gold"`
-	IsEmployee        bool   `json:"is_employee"`
-	PublicDescription string `json:"public_description,omitempty"`
+	Name              string
+	ID                string
+	CreatedUTC        int64
+	LinkKarma         int
+	CommentKarma      int
+	TotalKarma        int
+	IsMod             bool
+	IsGold            bool
+	IsEmployee        bool
+	PublicDescription string
 }
 
 type Subreddit struct {
-	Name          string `json:"name"`
-	Title         string `json:"title,omitempty"`
-	Description   string `json:"public_description,omitempty"`
-	Subscribers   *int   `json:"subscribers,omitempty"`
-	ActiveUsers   *int   `json:"active_user_count,omitempty"`
-	CreatedUTC    int64  `json:"created_utc,omitempty"`
-	Over18        *bool  `json:"over_18,omitempty"`
-	Lang          string `json:"lang,omitempty"`
-	URL           string `json:"url"`
-	SubredditType string `json:"subreddit_type,omitempty"`
+	Name          string
+	Title         string
+	Description   string
+	Subscribers   *int
+	ActiveUsers   *int
+	CreatedUTC    int64
+	Over18        *bool
+	Lang          string
+	URL           string
+	SubredditType string
+	Rules         []Rule
 }
 
+// Rule is one of a subreddit's posting rules. Worth reading before a human
+// asks "why was this removed" or "can I post X here".
+type Rule struct {
+	Name            string
+	Kind            string
+	Description     string
+	ViolationReason string
+}
+
+// WikiPage is a subreddit wiki page: FAQs, guides and community documentation
+// that exist nowhere else in the API.
+type WikiPage struct {
+	Subreddit  string
+	Page       string
+	Content    string
+	RevisedUTC int64
+	RevisedBy  string
+	URL        string
+}
+
+// source is embedded in every list so the renderer can say where the data came
+// from and which fields to distrust.
+type source struct {
+	DataSource string
+	Note       string
+}
+
+func apiSource() source { return source{DataSource: SourceAPI} }
+func rssSource() source { return source{DataSource: SourceRSS, Note: rssNote} }
+
 type PostList struct {
-	Posts      []Post `json:"posts"`
-	After      string `json:"after,omitempty"`
-	DataSource string `json:"data_source"`
-	Note       string `json:"note,omitempty"`
+	source
+
+	Posts []Post
+	After string
 }
 
 type CommentList struct {
-	Comments []Comment `json:"comments"`
-	After    string    `json:"after,omitempty"`
+	source
+
+	Comments []Comment
+	After    string
 	// MoreCount is how many replies Reddit collapsed behind "load more"
 	// placeholders and this response therefore does not contain.
-	MoreCount int `json:"more_count,omitempty"`
+	MoreCount int
 	// MoreParentIDs are the comments whose replies were collapsed. Pass one as
 	// comment_id to get_post_comments to expand that subtree.
-	MoreParentIDs []string `json:"more_parent_ids,omitempty"`
-	DataSource    string   `json:"data_source"`
-	Note          string   `json:"note,omitempty"`
+	MoreParentIDs []string
 }
 
 type SubredditList struct {
-	Subreddits []Subreddit `json:"subreddits"`
-	After      string      `json:"after,omitempty"`
-	DataSource string      `json:"data_source"`
-	Note       string      `json:"note,omitempty"`
+	source
+
+	Subreddits []Subreddit
+	After      string
+}
+
+type UserList struct {
+	source
+
+	Users []User
+	After string
 }
 
 // maxMoreParents caps how many drill-in ids are reported, so a thread with
@@ -175,6 +214,7 @@ func (r rawPost) toPost(maxText int) Post {
 
 type rawComment struct {
 	ID          string          `json:"id"`
+	Subreddit   string          `json:"subreddit"`
 	Author      string          `json:"author"`
 	Body        string          `json:"body"`
 	Score       int             `json:"score"`
@@ -211,6 +251,7 @@ func (r rawComment) flatten(parentID string, depth, maxText int, out *[]Comment,
 		ID:            r.ID,
 		ParentID:      parentID,
 		Depth:         depth,
+		Subreddit:     r.Subreddit,
 		Author:        r.Author,
 		Body:          body,
 		BodyTruncated: truncated,
@@ -316,7 +357,7 @@ func decodePostListing(body json.RawMessage, maxText int) (*PostList, error) {
 		return nil, fmt.Errorf("decode post listing: %w", err)
 	}
 
-	out := &PostList{After: listing.Data.After, DataSource: SourceAPI, Posts: []Post{}}
+	out := &PostList{source: apiSource(), After: listing.Data.After}
 
 	for _, ch := range listing.Data.Children {
 		if ch.Kind != "t3" {
@@ -340,11 +381,7 @@ func decodeCommentListing(body json.RawMessage, maxText int) (*CommentList, erro
 		return nil, fmt.Errorf("decode comment listing: %w", err)
 	}
 
-	out := &CommentList{
-		Comments:   make([]Comment, 0, len(listing.Data.Children)),
-		After:      listing.Data.After,
-		DataSource: SourceAPI,
-	}
+	out := &CommentList{source: apiSource(), After: listing.Data.After}
 
 	var more moreTracker
 
@@ -377,7 +414,7 @@ func decodeSubredditListing(body json.RawMessage) (*SubredditList, error) {
 		return nil, fmt.Errorf("decode subreddit listing: %w", err)
 	}
 
-	out := &SubredditList{After: listing.Data.After, DataSource: SourceAPI, Subreddits: []Subreddit{}}
+	out := &SubredditList{source: apiSource(), After: listing.Data.After}
 
 	for _, ch := range listing.Data.Children {
 		if ch.Kind != "t5" {
@@ -393,6 +430,83 @@ func decodeSubredditListing(body json.RawMessage) (*SubredditList, error) {
 	}
 
 	return out, nil
+}
+
+func decodeUserListing(body json.RawMessage) (*UserList, error) {
+	var listing rawListing
+	if err := json.Unmarshal(body, &listing); err != nil {
+		return nil, fmt.Errorf("decode user listing: %w", err)
+	}
+
+	out := &UserList{source: apiSource(), After: listing.Data.After}
+
+	for _, ch := range listing.Data.Children {
+		if ch.Kind != "t2" {
+			continue
+		}
+
+		var ru rawUser
+		if err := json.Unmarshal(ch.Data, &ru); err != nil {
+			return nil, fmt.Errorf("decode user: %w", err)
+		}
+
+		out.Users = append(out.Users, ru.toUser())
+	}
+
+	return out, nil
+}
+
+func decodeRules(body json.RawMessage) ([]Rule, error) {
+	var payload struct {
+		Rules []struct {
+			ShortName       string `json:"short_name"`
+			Kind            string `json:"kind"`
+			Description     string `json:"description"`
+			ViolationReason string `json:"violation_reason"`
+		} `json:"rules"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode rules: %w", err)
+	}
+
+	rules := make([]Rule, 0, len(payload.Rules))
+	for _, r := range payload.Rules {
+		rules = append(rules, Rule{
+			Name:            r.ShortName,
+			Kind:            r.Kind,
+			Description:     r.Description,
+			ViolationReason: r.ViolationReason,
+		})
+	}
+
+	return rules, nil
+}
+
+func decodeWikiPage(body json.RawMessage, subreddit, page string) (*WikiPage, error) {
+	var payload struct {
+		Kind string `json:"kind"`
+		Data struct {
+			ContentMD    string  `json:"content_md"`
+			RevisionDate float64 `json:"revision_date"`
+			RevisionBy   struct {
+				Data rawUser `json:"data"`
+			} `json:"revision_by"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode wiki page: %w", err)
+	}
+
+	return &WikiPage{
+		Subreddit:  subreddit,
+		Page:       page,
+		Content:    payload.Data.ContentMD,
+		RevisedUTC: int64(payload.Data.RevisionDate),
+		RevisedBy:  payload.Data.RevisionBy.Data.Name,
+		URL:        anonHost + "/r/" + subreddit + "/wiki/" + page,
+	}, nil
 }
 
 func absolutePermalink(permalink string) string {
