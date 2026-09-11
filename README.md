@@ -13,13 +13,44 @@ It speaks two transports:
 
 Select one with `MCP_TRANSPORT=stdio|http` or the `--transport` flag (the flag wins).
 
-## Running from `.mcp.json`
+## Installing
 
-### Installed binary (recommended)
+### Pre-built binary (recommended)
+
+Every tagged release ships static binaries for linux, macOS and Windows on amd64 and
+arm64 — no Go toolchain needed. Pick an archive from the
+[latest release](https://github.com/rishenco/reddit-mcp/releases/latest), or fetch the
+one for your platform:
+
+```sh
+VERSION=0.1.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')                 # linux or darwin
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')  # amd64 or arm64
+
+curl -fsSL -o reddit-mcp.tar.gz \
+  "https://github.com/rishenco/reddit-mcp/releases/download/v$VERSION/reddit-mcp_${VERSION}_${OS}_${ARCH}.tar.gz"
+tar -xzf reddit-mcp.tar.gz                                  # → ./reddit-mcp
+sudo install reddit-mcp /usr/local/bin/reddit-mcp
+reddit-mcp --version
+```
+
+Windows builds are `.zip` instead. Each release also carries a `checksums.txt`, so the
+download can be verified before it is installed:
+
+```sh
+curl -fsSLO "https://github.com/rishenco/reddit-mcp/releases/download/v$VERSION/checksums.txt"
+sha256sum --ignore-missing -c checksums.txt   # macOS: shasum -a 256 -c checksums.txt
+```
+
+### From source
 
 ```sh
 go install github.com/rishenco/reddit-mcp/cmd/reddit-mcp@latest   # → $(go env GOPATH)/bin/reddit-mcp
 ```
+
+## Running from `.mcp.json`
+
+Point the client at the installed binary:
 
 ```json
 {
@@ -36,9 +67,9 @@ go install github.com/rishenco/reddit-mcp/cmd/reddit-mcp@latest   # → $(go env
 }
 ```
 
-Use the absolute path (`/Users/you/go/bin/reddit-mcp`) if `$GOPATH/bin` is not on the
-`PATH` the MCP client inherits. Credentials are optional — drop the `env` block to run
-in anonymous mode.
+Use an absolute path (`/usr/local/bin/reddit-mcp`, or `/Users/you/go/bin/reddit-mcp`
+for `go install`) if the install location is not on the `PATH` the MCP client inherits.
+Credentials are optional — drop the `env` block to run in anonymous mode.
 
 ### From a checkout
 
@@ -127,6 +158,28 @@ With them it uses app-only OAuth against `oauth.reddit.com` (~60 req/min); creat
 "script" app at <https://www.reddit.com/prefs/apps>.
 
 Logs always go to stderr, so they never corrupt the MCP stream on stdout.
+
+## Releasing
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which cross-compiles every
+platform, writes `checksums.txt`, and publishes them to a GitHub release with generated
+notes:
+
+```sh
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+The workflow can also be started by hand from the Actions tab for a tag that already
+exists. The archives are built by `scripts/build-dist.sh`, so the same set can be
+produced locally:
+
+```sh
+make dist VERSION=v0.1.0   # → dist/
+```
+
+The tag is stamped into the binary with `-ldflags -X main.version`, and is what
+`reddit-mcp --version` and the MCP handshake report.
 
 ## Tools
 
