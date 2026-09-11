@@ -9,4 +9,5 @@ services:
     env_file:
       - .env
     environment:
+      MCP_TRANSPORT: http
       HTTP_ADDR: 0.0.0.0:8080
