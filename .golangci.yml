@@ -54,9 +54,18 @@ linters:
           json: snake
           yaml: snake
         use-field-name: false
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        # fetchList is generic over the listing type it decodes.
+        - generic
     varnamelen:
       ignore-names:
         - err
+        - c
         - rv
         - ch
         - cb

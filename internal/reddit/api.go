@@ -30,6 +30,58 @@ var (
 	subredditFinds = []string{"search", "popular", "new"}
 )
 
+// fetchList is the shape every listing read takes: call the Data API, and when
+// Reddit refuses logged-out access, read the feed equivalent instead. An empty
+// rssPath means this read has no feed, so the block surfaces as an error naming
+// the credentials to set.
+func fetchList[T any](
+	ctx context.Context, c *Client, what string,
+	apiPath string, apiParams url.Values, decode func(json.RawMessage) (T, error),
+	rssPath string, rssQuery url.Values, parse func([]byte) (T, error),
+) (T, error) {
+	var zero T
+
+	body, err := c.get(ctx, apiPath, apiParams)
+	if err != nil {
+		if !IsBlocked(err) || rssPath == "" {
+			return zero, fmt.Errorf("%s: %w", what, err)
+		}
+
+		raw, rerr := c.getRSS(ctx, rssPath, rssQuery)
+		if rerr != nil {
+			return zero, fmt.Errorf("%s (rss): %w", what, rerr)
+		}
+
+		return parse(raw)
+	}
+
+	list, err := decode(body)
+	if err != nil {
+		return zero, fmt.Errorf("%s: %w", what, err)
+	}
+
+	return list, nil
+}
+
+// The decoders below bind the client's text limits, which fetchList does not
+// need to know about.
+
+func (c *Client) postDecoder() func(json.RawMessage) (*PostList, error) {
+	return func(body json.RawMessage) (*PostList, error) { return decodePostListing(body, c.listingText) }
+}
+
+func (c *Client) postParser() func([]byte) (*PostList, error) {
+	return func(raw []byte) (*PostList, error) { return parseRSSPosts(raw, c.listingText) }
+}
+
+func (c *Client) commentDecoder() func(json.RawMessage) (*CommentList, error) {
+	return func(body json.RawMessage) (*CommentList, error) { return decodeCommentListing(body, c.listingText) }
+}
+
+func (c *Client) commentParser() func([]byte) (*CommentList, error) {
+	return func(raw []byte) (*CommentList, error) { return parseRSSComments(raw, c.listingText) }
+}
+
 // --- listings ------------------------------------------------------------
 
 // BrowseSubreddit lists posts from one or more subreddits. Several names
@@ -53,21 +105,9 @@ func (c *Client) BrowseSubreddit(
 		return nil, err
 	}
 
-	body, err := c.get(ctx, "/r/"+name+"/"+sort, listingParams(after, limit, sort, timeFilter))
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("browse subreddit: %w", err)
-		}
-
-		return c.postsFromRSS(ctx, "/r/"+name+"/"+sort+"/.rss", rssParams(limit, sort, timeFilter))
-	}
-
-	list, err := decodePostListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("browse subreddit: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "browse subreddit",
+		"/r/"+name+"/"+sort, listingParams(after, limit, sort, timeFilter), c.postDecoder(),
+		"/r/"+name+"/"+sort+"/.rss", rssParams(limit, sort, timeFilter), c.postParser())
 }
 
 func (c *Client) SearchReddit(
@@ -112,21 +152,9 @@ func (c *Client) SearchReddit(
 
 	setIfNotEmpty(params, "after", after)
 
-	body, err := c.get(ctx, path, params)
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("search reddit: %w", err)
-		}
-
-		return c.postsFromRSS(ctx, rssPath, rssQuery)
-	}
-
-	list, err := decodePostListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("search reddit: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "search reddit",
+		path, params, c.postDecoder(),
+		rssPath, rssQuery, c.postParser())
 }
 
 // BrowseComments reads a comment stream: every recent comment in a subreddit,
@@ -168,26 +196,9 @@ func (c *Client) BrowseComments(
 		return nil, err
 	}
 
-	body, err := c.get(ctx, path, userListingParams(after, limit, sort, timeFilter))
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("browse comments: %w", err)
-		}
-
-		raw, rerr := c.getRSS(ctx, rssPath, rssParams(limit, sort, timeFilter))
-		if rerr != nil {
-			return nil, fmt.Errorf("browse comments (rss): %w", rerr)
-		}
-
-		return parseRSSComments(raw, c.listingText)
-	}
-
-	list, err := decodeCommentListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("browse comments: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "browse comments",
+		path, userListingParams(after, limit, sort, timeFilter), c.commentDecoder(),
+		rssPath, rssParams(limit, sort, timeFilter), c.commentParser())
 }
 
 // --- posts ---------------------------------------------------------------
@@ -247,17 +258,8 @@ func (c *Client) FindPostsByURL(ctx context.Context, target string, limit int) (
 	params.Set("url", target)
 	params.Set("limit", strconv.Itoa(clampLimit(limit)))
 
-	body, err := c.get(ctx, "/api/info", params)
-	if err != nil {
-		return nil, fmt.Errorf("find posts by url: %w", err)
-	}
-
-	list, err := decodePostListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("find posts by url: %w", err)
-	}
-
-	return list, nil
+	// Reddit indexes submissions by target URL; there is no feed equivalent.
+	return fetchList(ctx, c, "find posts by url", "/api/info", params, c.postDecoder(), "", nil, nil)
 }
 
 // FindDuplicates lists the other threads discussing the same link, which is
@@ -408,21 +410,9 @@ func (c *Client) FindSubreddits(ctx context.Context, query, sort, after string, 
 		rssQuery.Set("q", query)
 	}
 
-	body, err := c.get(ctx, path, params)
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("find subreddits: %w", err)
-		}
-
-		return c.subredditsFromRSS(ctx, rssPath, rssQuery)
-	}
-
-	list, err := decodeSubredditListing(body)
-	if err != nil {
-		return nil, fmt.Errorf("find subreddits: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "find subreddits",
+		path, params, decodeSubredditListing,
+		rssPath, rssQuery, parseRSSSubreddits)
 }
 
 func (c *Client) GetSubredditInfo(ctx context.Context, name string, includeRules bool) (*Subreddit, error) {
@@ -526,17 +516,7 @@ func (c *Client) SearchUsers(ctx context.Context, query, after string, limit int
 	params.Set("limit", strconv.Itoa(clampLimit(limit)))
 	setIfNotEmpty(params, "after", after)
 
-	body, err := c.get(ctx, "/users/search", params)
-	if err != nil {
-		return nil, fmt.Errorf("search users: %w", err)
-	}
-
-	list, err := decodeUserListing(body)
-	if err != nil {
-		return nil, fmt.Errorf("search users: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "search users", "/users/search", params, decodeUserListing, "", nil, nil)
 }
 
 func (c *Client) GetUserPosts(
@@ -557,42 +537,12 @@ func (c *Client) GetUserPosts(
 		return nil, err
 	}
 
-	body, err := c.get(ctx, "/user/"+name+"/submitted", userListingParams(after, limit, sort, timeFilter))
-	if err != nil {
-		if !IsBlocked(err) {
-			return nil, fmt.Errorf("get user posts: %w", err)
-		}
-
-		return c.postsFromRSS(ctx, "/user/"+name+"/submitted/.rss", rssParams(limit, sort, timeFilter))
-	}
-
-	list, err := decodePostListing(body, c.listingText)
-	if err != nil {
-		return nil, fmt.Errorf("get user posts: %w", err)
-	}
-
-	return list, nil
+	return fetchList(ctx, c, "get user posts",
+		"/user/"+name+"/submitted", userListingParams(after, limit, sort, timeFilter), c.postDecoder(),
+		"/user/"+name+"/submitted/.rss", rssParams(limit, sort, timeFilter), c.postParser())
 }
 
 // --- RSS fallbacks -------------------------------------------------------
-
-func (c *Client) postsFromRSS(ctx context.Context, path string, params url.Values) (*PostList, error) {
-	raw, err := c.getRSS(ctx, path, params)
-	if err != nil {
-		return nil, fmt.Errorf("rss fallback %s: %w", path, err)
-	}
-
-	return parseRSSPosts(raw, c.listingText)
-}
-
-func (c *Client) subredditsFromRSS(ctx context.Context, path string, params url.Values) (*SubredditList, error) {
-	raw, err := c.getRSS(ctx, path, params)
-	if err != nil {
-		return nil, fmt.Errorf("rss fallback %s: %w", path, err)
-	}
-
-	return parseRSSSubreddits(raw)
-}
 
 // subredditFromRSS reconstructs what it can of a subreddit's metadata from its
 // listing feed. There is no about.rss, so subscriber and activity counts are
