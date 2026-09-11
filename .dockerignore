@@ -8,4 +8,5 @@ Dockerfile
 compose.yaml
 Makefile
 bin/
+dist/
 *.md

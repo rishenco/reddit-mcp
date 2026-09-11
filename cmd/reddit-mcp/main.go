@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -25,7 +26,6 @@ import (
 
 const (
 	serverName      = "reddit-mcp"
-	serverVersion   = "0.1.0"
 	shutdownTimeout = 10 * time.Second
 
 	// jsonrpcCodeServerClosing is jsonrpc2's non-standard "server is closing"
@@ -33,10 +33,21 @@ const (
 	jsonrpcCodeServerClosing = -32004
 )
 
+// version is stamped into release builds with -ldflags "-X main.version=...".
+// Builds that skip it fall back to the module version `go install` records.
+var version = ""
+
 func main() {
 	transport := flag.String("transport", "", "MCP transport: stdio (default) or http; overrides MCP_TRANSPORT")
+	printVersion := flag.Bool("version", false, "print the version and exit")
 
 	flag.Parse()
+
+	if *printVersion {
+		_, _ = fmt.Fprintln(os.Stdout, serverName+" "+serverVersion())
+
+		return
+	}
 
 	if err := run(*transport); err != nil {
 		slog.Error("fatal", "err", err)
@@ -82,7 +93,7 @@ func run(transportFlag string) error {
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
-		Version: serverVersion,
+		Version: serverVersion(),
 	}, nil)
 	tools.Register(mcpServer, redditClient)
 
@@ -91,6 +102,20 @@ func run(transportFlag string) error {
 	}
 
 	return runHTTP(ctx, mcpServer, cfg.HTTPAddr, logger)
+}
+
+// serverVersion reports the build's version: the stamped one for release
+// binaries, the module version for `go install`ed ones, "dev" otherwise.
+func serverVersion() string {
+	if version != "" {
+		return version
+	}
+
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+
+	return "dev"
 }
 
 func runStdio(ctx context.Context, mcpServer *mcp.Server, logger *slog.Logger) error {
